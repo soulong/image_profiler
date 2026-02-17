@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "image_profiler"
+version = "0.1.0"
+description = "A package for managing and analyzing microscopy image datasets"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Image Profiler Authors"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+keywords = ["microscopy", "image-analysis", "cellprofiler", "cellpose"]
+
+dependencies = [
+    "numpy",
+    "pandas",
+    "natsort",
+    "tqdm",
+    "imageio",
+    "cellpose",
+    "torch",
+    "jax",
+    "scikit-image",
+    "scipy",
+    "pydantic",
+    "tifffile",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "black",
+    "isort",
+    "flake8",
+    "mypy",
+]
+
+[project.urls]
+Homepage = "https://github.com/user/image_profiler"
+Documentation = "https://github.com/user/image_profiler#readme"
+Repository = "https://github.com/user/image_profiler.git"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+image_profiler = ["py.typed"]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
