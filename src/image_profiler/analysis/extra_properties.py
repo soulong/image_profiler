@@ -574,7 +574,7 @@ _EXTRA_PROPERTIES_KEYS = frozenset({"glcm", "radial", "granularity"})
 def build_extra_properties(
     extra_properties: Optional[List[Union[str, Callable]]],
     n_channels: int,
-    channel_names: List[str],
+    channels: List[str],
     extra_properties_kwargs: Optional[List[Optional[Dict]]] = None,
 ) -> tuple:
     """Build extra-property callables and their col_names metadata.
@@ -582,7 +582,7 @@ def build_extra_properties(
     Accepts a mix of shorthand strings (``'glcm'``, ``'radial'``,
     ``'granularity'``) and plain callables.  Strings are expanded into
     factory-built closures so they receive the correct ``n_channels`` and
-    ``channel_names`` automatically.
+    ``channels`` automatically.
 
     Parameters
     ----------
@@ -590,7 +590,7 @@ def build_extra_properties(
         Each item is either a shorthand string or a ready-made callable.
     n_channels : int
         Number of image channels (needed by the factory functions).
-    channel_names : list of str
+    channels : list of str
         Channel names (needed by the factory functions for column naming).
     extra_properties_kwargs : list of dict or None, optional
         Per-item keyword arguments forwarded to string-based factory functions.
@@ -622,13 +622,13 @@ def build_extra_properties(
                     f"Available: {sorted(_EXTRA_PROPERTIES_KEYS)}"
                 )
             if prop == "glcm":
-                fn, entry = make_glcm_func(n_channels, channel_names, **kw)
+                fn, entry = make_glcm_func(n_channels, channels, **kw)
                 col_names["glcm"] = entry
             elif prop == "granularity":
-                fn, entry = make_granularity_func(n_channels, channel_names, **kw)
+                fn, entry = make_granularity_func(n_channels, channels, **kw)
                 col_names["granularity"] = entry
             elif prop == "radial":
-                fn, entry = make_radial_func(n_channels, channel_names, **kw)
+                fn, entry = make_radial_func(n_channels, channels, **kw)
                 col_names["radial_distribution"] = entry
             callables.append(fn)
 

@@ -23,8 +23,8 @@ from image_profiler.preprocessing.basic.basic import BaSiC
 def _basic_fit(
     image_paths: List[Path],
     n_image: int = 50,
-    enable_darkfield: bool = True,
-    working_size: int = 128,
+    enable_darkfield: bool = False,
+    working_size: int = 64,
 ) -> Optional[BaSiC]:
     """Fit BaSiC model on a set of images.
 

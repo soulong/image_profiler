@@ -110,8 +110,7 @@ def _profile_objects(
     mask: np.ndarray,
     channel_names: List[str],
     parent_mask: Optional[np.ndarray] = None,
-    channels: Optional[List[str]] = None,
-    profile: Optional[List[str]] = None,
+    profile: Optional[List[str]] = ['shape', 'intensity'],
     extra_properties: Optional[List[Callable]] = None,
     col_names: Optional[Dict] = None,
 ) -> pd.DataFrame:
@@ -127,9 +126,6 @@ def _profile_objects(
         Channel names corresponding to the C axis of ``image``.
     parent_mask : np.ndarray, optional
         Parent mask for hierarchical relationship (adds ``parent_id`` column).
-    channels : list of str, optional
-        Subset of channels to include in intensity measurements.
-        None = all channels.
     profile : list of str, optional
         Feature families to compute.  Any combination of "shape" and "intensity".
         Default: both.
@@ -147,11 +143,8 @@ def _profile_objects(
     pd.DataFrame
         One row per object.  Empty DataFrame when no objects are found.
     """
-    if profile is None:
-        profile = ["shape", "intensity"]
-
-    if channels is None:
-        channels = channel_names
+    # if profile is None:
+    #     profile = ["shape", "intensity"]
 
     object_ids = np.unique(mask[mask != 0])
     if len(object_ids) == 0:
@@ -162,7 +155,7 @@ def _profile_objects(
     # ------------------------------------------------------------------ #
     properties = ["label"]
 
-    if "shape" in profile:
+    if profile and "shape" in profile:
         properties.extend([
             "area", "eccentricity", "solidity",
             "equivalent_diameter_area", "extent",
@@ -226,7 +219,7 @@ def _profile_objects(
             result["parent_id"] = parent_relationships.get(obj_id, 0)
             
         # ----- shape features ----------------------------------------- #
-        if "shape" in profile:
+        if profile and "shape" in profile:
             result["shape_area"]                = row_raw["area"]
             # result["shape_perimeter"]           = row_raw["perimeter"]
             result["shape_eccentricity"]        = row_raw["eccentricity"]
@@ -244,12 +237,9 @@ def _profile_objects(
             # result["centroid_x"]          = row_raw["centroid-1"]
 
         # ----- intensity features ------------------------------------- #
-        if "intensity" in profile:
+        if profile and "intensity" in profile:
             obj_mask = mask == obj_id
-            for ch_name in channels:
-                if ch_name not in channel_names:
-                    continue
-                ch_idx = channel_names.index(ch_name)
+            for ch_idx, ch_name in enumerate(channel_names):
 
                 # for stat in ("intensity_mean", "intensity_max",
                 #              "intensity_min", "intensity_std"):
@@ -279,11 +269,10 @@ def _profile_objects(
 def profile_object_single_row(
     image_data: np.ndarray,
     mask_data: Dict[str, np.ndarray],
-    channel_names: List[str],
     metadata_row: Dict,
+    channel_names: List[str],
     mask_name: str,
     parent_mask_name: Optional[str] = None,
-    channels: Optional[List[str]] = None,
     profile: Optional[List[str]] = None,
     extra_properties: Optional[List[Callable]] = None,
     col_names: Optional[Dict] = None,
@@ -296,16 +285,14 @@ def profile_object_single_row(
         Image stack with shape (C, Y, X).
     mask_data : dict of str to np.ndarray
         Mask arrays keyed by mask name (without the ``mask_`` prefix).
-    channel_names : list of str
-        Channel names corresponding to image channels.
     metadata_row : dict
         Metadata for this row; image/mask path columns are stripped.
+    channel_names : list of str
+        Channel names corresponding to image_data channels.
     mask_name : str
         Key in ``mask_data`` to use as the segmentation mask.
     parent_mask_name : str, optional
         Key in ``mask_data`` to use as the parent mask.
-    channels : list of str, optional
-        Subset of channels to include in intensity measurements.
     profile : list of str, optional
         Feature families: ``"shape"``, ``"intensity"``, or both.
     extra_properties : list of callable, optional
@@ -329,7 +316,6 @@ def profile_object_single_row(
         mask_data[mask_name],
         channel_names,
         parent_mask=parent_mask,
-        channels=channels,
         profile=profile,
         extra_properties=extra_properties,
         col_names=col_names,
