@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Union
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -488,7 +489,8 @@ class ImageDataset:
         thresholds: Optional[Dict[str, float]] = None,
         row_idx: Optional[int] = None,
         write_db: Union[bool, str, None] = True,
-        table_name="image"
+        table_name="image",
+        max_workers: Optional[int] = None
     ) -> Optional[pd.DataFrame]:
         """Profile images at whole-image level.
 
@@ -513,6 +515,9 @@ class ImageDataset:
             ``False`` / ``None`` → return aggregated ``pd.DataFrame``.
         table_name : str
             table name
+        max_workers : int, optional
+            Maximum number of worker threads to use for parallel processing.
+            If None, uses the default number of threads for the system.
 
         Returns
         -------
@@ -527,7 +532,7 @@ class ImageDataset:
             
         results = []
 
-        for idx in tqdm(indices, desc="Profiling images"):
+        def process_row(idx):
             image_data, _ = self.get_imageset(idx)
 
             row = self.metadata.iloc[idx]
@@ -555,8 +560,24 @@ class ImageDataset:
             
             if write_db:
                 write_results_to_db(db_path, table_name, result_df, if_exists="append")
+                return None
             else:
-                results.append(result_df)
+                return result_df
+
+        if max_workers is None or len(indices) <= 1:
+            # Use single-threaded processing for small datasets or when max_workers is None
+            for idx in tqdm(indices, desc="Profiling images"):
+                result_df = process_row(idx)
+                if result_df is not None:
+                    results.append(result_df)
+        else:
+            # Use multi-threaded processing for larger datasets
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_idx = {executor.submit(process_row, idx): idx for idx in indices}
+                for future in tqdm(as_completed(future_to_idx), total=len(indices), desc="Profiling images"):
+                    result_df = future.result()
+                    if result_df is not None:
+                        results.append(result_df)
                 
         return results
 
@@ -571,6 +592,7 @@ class ImageDataset:
         extra_properties_kwargs: Optional[List[Optional[Dict]]] = None,
         write_db: Union[bool, str, None] = True,
         table_name: str = None,
+        max_workers: Optional[int] = None
     ) -> Optional[pd.DataFrame]:
         """Profile objects using the specified segmentation mask.
 
@@ -605,6 +627,9 @@ class ImageDataset:
             ``False`` / ``None`` → return aggregated ``pd.DataFrame``.
         table_name : str
             table name, if None, use mask_name
+        max_workers : int, optional
+            Maximum number of worker threads to use for parallel processing.
+            If None, uses the default number of threads for the system.
 
         Returns
         -------
@@ -621,7 +646,6 @@ class ImageDataset:
             channels=channels,
             extra_properties_kwargs=extra_properties_kwargs,
         )
-        # print(col_names)
 
         if row_idx is None:
             indices = range(len(self.metadata))
@@ -630,7 +654,7 @@ class ImageDataset:
             
         results = []
         
-        for idx in tqdm(indices, desc=f"Profiling {mask_name}"):
+        def process_row(idx):
             row = self.metadata.iloc[idx]
 
             image_data, mask_data = self.get_imageset(idx, channels=channels, masks=mask_name)
@@ -660,11 +684,27 @@ class ImageDataset:
             else:
                 db_path = None
             
-            if write_db:
-                table_name = mask_name if table_name is None else table_name
-                write_results_to_db(db_path, table_name, result_df, if_exists="append")
+            if write_db and result_df is not None:
+                current_table_name = mask_name if table_name is None else table_name
+                write_results_to_db(db_path, current_table_name, result_df, if_exists="append")
+                return None
             else:
-                results.append(result_df)
+                return result_df
+
+        if max_workers is None or len(indices) <= 1:
+            # Use single-threaded processing for small datasets or when max_workers is None
+            for idx in tqdm(indices, desc=f"Profiling {mask_name}"):
+                result_df = process_row(idx)
+                if result_df is not None:
+                    results.append(result_df)
+        else:
+            # Use multi-threaded processing for larger datasets
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_idx = {executor.submit(process_row, idx): idx for idx in indices}
+                for future in tqdm(as_completed(future_to_idx), total=len(indices), desc=f"Profiling {mask_name}"):
+                    result_df = future.result()
+                    if result_df is not None:
+                        results.append(result_df)
                 
         return results
 

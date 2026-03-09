@@ -10,6 +10,9 @@ A Python package for managing and analyzing microscopy image datasets, with supp
 - **Preprocessing**: Apply BaSiC shading correction, tile images, and perform Z-stack projection
 - **Cropping**: Extract individual cells from images using segmentation masks
 - **Database Integration**: Save results to SQLite databases
+- **Multi-threading**: Parallel processing for faster profiling of large datasets
+- **Enhanced Error Handling**: Robust input validation and error reporting
+- **Comprehensive Documentation**: Detailed parameter descriptions and usage examples
 
 ## Installation
 
@@ -62,22 +65,25 @@ ds.segmentate('cell', chan1='ch1', chan2=None)
 
 # profiling
 
-## profile over whole image
+## profile over whole image with multi-threading
 ds.profile_image(channels=['ch1', 'ch2'], 
                 thresholds={'ch1': None, 'ch2': None},
-                row_idx=None, write_db='result.db')
+                row_idx=None, write_db='result.db',
+                max_workers=4)  # Use 4 threads for parallel processing
 
-## profile over individual segmentated object
+## profile over individual segmentated object with multi-threading
 ds.profile_object(mask_name='cell', row_idx=None, channels=['ch1'], 
                 profile=["shape", "intensity"], 
-                write_db='result.db', table_name='cell')
+                write_db='result.db', table_name='cell',
+                max_workers=4)  # Use 4 threads for parallel processing
 
 ## profile with extra properties over individual segmentated object
 ds.profile_object(mask_name='cell', parent_mask_name=None, row_idx=None, channels=['ch1','ch2'], 
                 profile=["intensity"], 
                 extra_properties=['radial', 'granularity', 'glcm'],
                 extra_properties_kwargs=[{'n_bins': 5}, {'background_radius': 20, 'spectrum_length': 10, 'subsample_size': 0.25}, {'distances': [2]}],
-                write_db='result.db', table_name='cell2')
+                write_db='result.db', table_name='cell2',
+                max_workers=4)  # Use 4 threads for parallel processing
 
 
 # crop single cell
