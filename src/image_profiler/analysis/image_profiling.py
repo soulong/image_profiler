@@ -8,32 +8,23 @@ import numpy as np
 from skimage.measure import label, regionprops_table
 
 
-def _skewness(arr: np.ndarray) -> float:
-    """Calculate skewness of an array."""
-    mean = np.mean(arr)
-    std = np.std(arr)
-    if std == 0:
-        return 0.0
-    return float(np.mean(((arr - mean) / std) ** 3))
-
-
-def _profile_image(
-    image: np.ndarray,
+def _measure_image(
+    image_data: np.ndarray,
     channel_names: List[str],
-    channels: Optional[List[str]] = None,
+    intensity_channels: Optional[List[str]] = None,
     thresholds: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Profile a single image stack at the whole-image level.
 
     Parameters
     ----------
-    image : np.ndarray
-        Image stack with shape (C, Y, X), where C is the number of channels,
-        Y is the height, and X is the width of the image.
+    image_data : np.ndarray
+        Image stack with shape (Y, X, C), where Y is the height,
+        X is the width, and C is the number of channels of the image.
     channel_names : list of str
         Channel names corresponding to image channels (C axis).
         Must be in the same order as the channels in the image stack.
-    channels : list of str, optional
+    intensity_channels : list of str, optional
         Subset of channel names to profile. None = all channels.
         Must be a subset of channel_names.
     thresholds : dict of str to float, optional
@@ -48,42 +39,27 @@ def _profile_image(
         Flat dictionary of measured features keyed by "{channel_name}_{metric}".
         Includes intensity statistics (mean, sum, percentiles) and optionally
         object statistics (area, count, mean object area) if thresholds are provided.
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> image = np.random.rand(2, 100, 100)  # 2 channels, 100x100 image
-    >>> channel_names = ['DAPI', 'GFP']
-    >>> result = _profile_image(image, channel_names)
-    >>> print(list(result.keys())[:5])  # Show first 5 keys
-    ['intensity_mean_DAPI', 'intensity_sum_DAPI', 'intensity_q0.1_DAPI', 'intensity_q1_DAPI', 'intensity_q25_DAPI']
-
-    >>> # With thresholds
-    >>> thresholds = {'DAPI': 0.5, 'GFP': 0.7}
-    >>> result_with_thresholds = _profile_image(image, channel_names, thresholds=thresholds)
-    >>> print('DAPI area:', result_with_thresholds['shape_area_DAPI'])
-    DAPI area: 2500
     """
     # Validate inputs
-    if not isinstance(image, np.ndarray):
-        raise TypeError(f"image must be a numpy array, got {type(image).__name__}")
+    if not isinstance(image_data, np.ndarray):
+        raise TypeError(f"image_data must be a numpy array, got {type(image_data).__name__}")
     
-    if image.ndim != 3:
-        raise ValueError(f"image must be 3D with shape (C, Y, X), got shape {image.shape}")
+    if image_data.ndim != 3:
+        raise ValueError(f"image_data must be 3D with shape (Y, X, C), got shape {image_data.shape}")
     
     if not isinstance(channel_names, list) or not all(isinstance(name, str) for name in channel_names):
         raise TypeError("channel_names must be a list of strings")
     
-    if len(channel_names) != image.shape[0]:
-        raise ValueError(f"Number of channel names ({len(channel_names)}) must match number of channels in image ({image.shape[0]})")
+    if len(channel_names) != image_data.shape[2]:
+        raise ValueError(f"Number of channel names ({len(channel_names)}) must match number of channels in image ({image_data.shape[2]})")
     
-    if channels is None:
-        channels = channel_names
+    if intensity_channels is None:
+        intensity_channels = channel_names
     else:
-        if not isinstance(channels, list) or not all(isinstance(name, str) for name in channels):
-            raise TypeError("channels must be a list of strings")
+        if not isinstance(intensity_channels, list) or not all(isinstance(name, str) for name in intensity_channels):
+            raise TypeError("intensity_channels must be a list of strings")
         
-        for ch_name in channels:
+        for ch_name in intensity_channels:
             if ch_name not in channel_names:
                 raise ValueError(f"Channel name '{ch_name}' not found in channel_names")
     
@@ -101,9 +77,9 @@ def _profile_image(
 
     result: Dict[str, Any] = {}
 
-    for ch_name in channels:
+    for ch_name in intensity_channels:
         ch_idx = channel_names.index(ch_name)
-        img = image[ch_idx]  # (Y, X) — image must be (C, Y, X)
+        img = image_data[:, :, ch_idx]  # (Y, X) — image must be (Y, X, C)
         
         # Skip if image is empty or all zeros
         if img.size == 0 or np.all(img == 0):
@@ -143,11 +119,11 @@ def _profile_image(
     return result
 
 
-def profile_image_single_row(
+def measure_image(
     image_data: np.ndarray,
     channel_names: List[str],
     metadata_row: Dict,
-    channels: Optional[List[str]] = None,
+    intensity_channels: Optional[List[str]] = None,
     thresholds: Optional[Dict[str, float]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Profile a single dataset row at image level.
@@ -155,15 +131,15 @@ def profile_image_single_row(
     Parameters
     ----------
     image_data : np.ndarray
-        Image stack with shape (C, Y, X), where C is the number of channels,
-        Y is the height, and X is the width of the image.
+        Image stack with shape (Y, X, C), where Y is the height,
+        X is the width, and C is the number of channels of the image.
     channel_names : list of str
         Channel names corresponding to image channels (C axis).
         Must be in the same order as the channels in the image stack.
     metadata_row : dict
         Metadata for this row, containing information about the image acquisition.
         Image and mask path columns will be stripped from the returned result.
-    channels : list of str, optional
+    intensity_channels : list of str, optional
         Subset of channel names to profile. None = all channels.
         Must be a subset of channel_names.
     thresholds : dict of str to float, optional
@@ -178,17 +154,6 @@ def profile_image_single_row(
         Profiling result merged with metadata, or None if image_data is None.
         The returned dict contains both the metadata and the computed image features.
 
-    Examples
-    --------
-    >>> import numpy as np
-    >>> image_data = np.random.rand(2, 100, 100)  # 2 channels, 100x100 image
-    >>> channel_names = ['DAPI', 'GFP']
-    >>> metadata_row = {'row': '01', 'column': '01', 'field': '01', 'DAPI': 'dapi.tiff', 'GFP': 'gfp.tiff'}
-    >>> result = profile_image_single_row(image_data, channel_names, metadata_row)
-    >>> print('Metadata keys:', [k for k in result.keys() if k in metadata_row])
-    Metadata keys: ['row', 'column', 'field']
-    >>> print('Feature keys:', [k for k in result.keys() if 'intensity' in k][:3])
-    Feature keys: ['intensity_mean_DAPI', 'intensity_sum_DAPI', 'intensity_q0.1_DAPI']
     """
     if image_data is None:
         return None
@@ -197,6 +162,9 @@ def profile_image_single_row(
     if not isinstance(image_data, np.ndarray):
         raise TypeError(f"image_data must be a numpy array, got {type(image_data).__name__}")
     
+    if image_data.ndim != 3:
+        raise ValueError(f"image_data must be 3D with shape (Y, X, C), got shape {image_data.shape}")
+    
     if not isinstance(channel_names, list) or not all(isinstance(name, str) for name in channel_names):
         raise TypeError("channel_names must be a list of strings")
     
@@ -204,10 +172,10 @@ def profile_image_single_row(
         raise TypeError(f"metadata_row must be a dictionary, got {type(metadata_row).__name__}")
 
     try:
-        image_result = _profile_image(
+        image_result = _measure_image(
             image_data,
             channel_names,
-            channels,
+            intensity_channels,
             thresholds,
         )
 

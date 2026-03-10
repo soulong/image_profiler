@@ -1,802 +1,565 @@
 """
-cellprofiler_regionprops.py
-============================
-Custom region-property functions compatible with ``skimage.measure.regionprops``
-and ``regionprops_table`` via the ``extra_properties`` argument.
+CellProfiler-equivalent feature extraction functions compatible with
+skimage.measure.regionprops_table `extra_properties` parameter.
 
-Three feature families matching CellProfiler:
-  * GLCM texture        – MeasureTexture   (13 Haralick features × distances,
-                           averaged over 4 angles: 0°, 45°, 90°, 135°)
-  * Granularity         – MeasureGranularity (morphological opening spectrum)
-  * Radial distribution – MeasureObjectRadialDistribution (rings from centroid)
+────────────────────────────────────────────────────────────────────
+KEY DESIGN: One callable per named output
+────────────────────────────────────────────────────────────────────
+regionprops_table uses fn.__name__ as the column name for scalars,
+or fn.__name__ + "-0", "-1", … for arrays.  To get fully semantic
+column names (no numeric suffix), every factory below returns a
+*list* of single-scalar callables, one per output dimension.
 
-Design
-------
-1. **Parameter passing via factory functions**
+    fns = make_radial_distribution(nbins=4, channel=0)
+    # fns[0].__name__ == "RadialDistribution_bin0_ch0"
+    # fns[1].__name__ == "RadialDistribution_bin1_ch0"
+    # fns[2].__name__ == "RadialDistribution_bin2_ch0"
+    # fns[3].__name__ == "RadialDistribution_bin3_ch0"
 
-   ``regionprops`` / ``regionprops_table`` call each extra-property function
-   with exactly two positional arguments: ``(image, intensity_image)``.
-   There is no mechanism to pass additional arguments directly.
-
-   The solution is **factory functions** (``make_glcm_func``, etc.) that return
-   a closure.  All parameters are captured in the closure, so the returned
-   function has the correct two-argument signature::
-
-       glcm_fn, glcm_cols = make_glcm_func(n_channels=3, distances=[1,2,3])
-       props = regionprops(label_image, intensity_image=img,
-                           extra_properties=[glcm_fn])
-
-2. **Custom channel names**
-
-   Pass ``channel_names=["DAPI","GFP","mCherry"]`` to any factory or to
-   ``build_extra_properties``.  When omitted, names default to
-   ``ch0, ch1, …``::
-
-       make_glcm_func(3, channel_names=["DAPI","GFP","mCherry"])
-       make_glcm_func(3)          # → ch0, ch1, ch2
-
-3. **Channel info is always last in feature names**::
-
-       glcm_d1_asm_DAPI
-       granularity_scale01_GFP
-       radial_bin0_FracAtD_mCherry
-
-4. **skimage multichannel behaviour (important!)**
-
-   When ``intensity_image`` has shape ``(H, W, C)``, skimage calls each
-   extra-property function **once per channel** (passing a 2D ``H×W`` slice)
-   and stacks the results into a ``(n_features_per_channel, C)`` array.
-   ``regionprops_table`` therefore produces column names like
-   ``{func_name}-{feat_idx}-{ch_idx}``.
-   The helper :func:`rename_regionprops_table` translates these back to the
-   human-readable names produced by the factory.
-
-Typical usage from another script
-----------------------------------
-::
-
-    from cellprofiler_regionprops import build_extra_properties, rename_regionprops_table
-    from skimage.measure import regionprops_table
-    import pandas as pd
-
-    extra_props, col_names = build_extra_properties(
-        n_channels=3,
-        channel_names=["DAPI", "GFP", "mCherry"],
-        glcm_distances=[1, 2, 3],
-        granularity_spectrum_length=16,
-        radial_n_bins=4,
+    props = regionprops_table(
+        label_img, intensity,
+        extra_properties=fns,
     )
+    # columns: RadialDistribution_bin0_ch0 … RadialDistribution_bin3_ch0
 
-    raw = regionprops_table(
-        label_image,
-        intensity_image=multichannel_img,   # shape (H, W, C)
-        properties=["label", "area"],
-        extra_properties=extra_props,
-    )
+────────────────────────────────────────────────────────────────────
+Naming convention  (channel index ALWAYS last)
+────────────────────────────────────────────────────────────────────
+Feature               Column pattern
+──────────────────────────────────────────────────────────────────
+Radial distribution   RadialDistribution_bin{i}_ch{c}
+                        i=0 → outermost ring, i=N-1 → centre
 
-    df = rename_regionprops_table(raw, col_names)
-    df.head()
+Granularity           Granularity_scale{s}_ch{c}
+                        s is the actual scale value (e.g. 1, 2, …16)
 
-Dependencies: numpy, scipy, scikit-image >= 0.19
+GLCM                  GLCM_{prop}_d{distance}_ch{c}
+                        prop ∈ {contrast, dissimilarity, homogeneity,
+                                energy, correlation, ASM}
+                        distance is the pixel offset (e.g. 1, 2, 4, 8)
+
+Correlation           Correlation_pearson_ch{a}_ch{b}
+  (standalone)          returned as a plain dict / DataFrame column
+────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
+
+import functools
+from typing import Sequence
 
 import numpy as np
-import pandas as pd
-from skimage.feature import graycomatrix
-from skimage.morphology import disk, erosion, opening, reconstruction
+from scipy.ndimage import distance_transform_edt
+from skimage.feature import graycomatrix, graycoprops
+from skimage.morphology import disk, erosion, dilation
+from skimage.transform import resize
 
-# ---------------------------------------------------------------------------
-# Internal constants
-# ---------------------------------------------------------------------------
-_GLCM_LEVELS: int = 256
-_DEFAULT_DISTANCES: List[int] = [1, 2, 3]
-# 4 angles: 0°, 45°, 90°, 135°
-_GLCM_ANGLES: List[float] = [0.0, np.pi / 4, np.pi / 2, 3 * np.pi / 4]
-_HARALICK_STATS: List[str] = [
-    "asm", "contrast", "correlation", "variance", "idm",
-    "sum_average", "sum_variance", "sum_entropy",
-    "entropy", "diff_variance", "diff_entropy", "imc1", "imc2",
-]
+# ════════════════════════════════════════════════════════════════════════════
+# Internal helper
+# ════════════════════════════════════════════════════════════════════════════
 
-# col_names dict value structure:
-#   {
-#     "names":      List[str],   # all names, channels-outer order
-#     "n_features": int,         # features per channel
-#     "n_channels": int,         # number of channels
-#   }
-_ColNamesEntry = Dict[str, object]
-
-def _resolve_channel_names(n_channels: int,
-                            names: Optional[Sequence[str]]) -> List[str]:
-    """Return validated channel name list, falling back to ch0, ch1, …"""
-    if names is not None:
-        if len(names) != n_channels:
-            raise ValueError(
-                f"channel_names has {len(names)} entries but n_channels={n_channels}."
-            )
-        return [str(n) for n in names]
-    return [f"ch{i}" for i in range(n_channels)]
+def _named(fn, name: str):
+    """Attach a __name__ to a callable so regionprops_table uses it as column name."""
+    fn.__name__ = name
+    fn.__qualname__ = name
+    return fn
 
 
-def _split_channels(intensity_image: np.ndarray) -> List[np.ndarray]:
-    """Return list of 2-D channel arrays from a 2-D or 3-D image."""
-    if intensity_image.ndim == 2:
-        return [intensity_image]
-    return [intensity_image[:, :, c] for c in range(intensity_image.shape[2])]
+# ════════════════════════════════════════════════════════════════════════════
+# 1. RADIAL DISTRIBUTION  (CellProfiler: MeasureObjectIntensityDistribution)
+# ════════════════════════════════════════════════════════════════════════════
 
-
-# ===========================================================================
-# Section 1 – GLCM / Texture  (matches CellProfiler MeasureTexture)
-# ===========================================================================
-
-def _normalize_channel(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
+def _radial_distribution_all(
+    regionmask: np.ndarray,
+    intensity: np.ndarray,
+    *,
+    nbins: int,
+    channel: int,
+) -> np.ndarray:
     """
-    Rescale masked pixels to [0, LEVELS-1].
-    Pixels outside the mask get sentinel value LEVELS so they are
-    excluded from the co-occurrence matrix automatically.
+    Compute the full radial distribution vector (internal, returns array).
+
+    Returns (nbins,) float array:
+      index 0 = outermost ring (edge), index nbins-1 = centre.
+      Values are fraction of total object intensity in each shell.
+
+    Algorithm (CellProfiler MeasureObjectIntensityDistribution – FracAtD):
+      1. distance_transform_edt on the binary mask gives each pixel its
+         distance from the nearest background pixel.
+      2. Normalise distances to [0, 1]: 0 = object edge, 1 = farthest interior.
+      3. Divide [0, 1] into nbins equal-width shells; accumulate intensity.
+      4. Divide each shell total by the object's total intensity.
+      5. Reverse so bin 0 = outermost shell (CellProfiler convention).
     """
-    out = np.full(img.shape, _GLCM_LEVELS, dtype=np.int32)
+    img = intensity[..., channel] if intensity.ndim == 3 else intensity
+    img = img.astype(float)
+    mask = regionmask.astype(bool)
+
     if not mask.any():
-        return out
-    vals = img[mask].astype(float)
-    lo, hi = vals.min(), vals.max()
-    scaled = (vals - lo) / (hi - lo) * (_GLCM_LEVELS - 1) if hi > lo else np.zeros_like(vals)
-    out[mask] = np.clip(scaled, 0, _GLCM_LEVELS - 1).astype(np.int32)
-    return out
+        return np.zeros(nbins)
+
+    dist = distance_transform_edt(mask)
+    max_dist = dist[mask].max()
+    if max_dist == 0:
+        return np.zeros(nbins)
+
+    norm_dist = dist[mask] / (max_dist + 1e-9)          # 0=edge … 1=centre
+    bin_idx = np.clip(np.floor(norm_dist * nbins).astype(int), 0, nbins - 1)
+
+    total = img[mask].sum()
+    fracs = np.zeros(nbins)
+    if total == 0:
+        return fracs
+    for b in range(nbins):
+        fracs[b] = img[mask][bin_idx == b].sum() / total
+
+    return fracs[::-1]   # reverse: index 0 = outermost ring
 
 
-def _masked_glcm(img_int: np.ndarray,
-                 distances: Sequence[int],
-                 angles: Sequence[float]) -> np.ndarray:
+def make_radial_distribution(
+    nbins: int = 4,
+    channel: int = 0,
+) -> list:
     """
-    Build normalised GLCM counting only pixel pairs where BOTH pixels are
-    inside the mask.  Out-of-mask pixels carry sentinel value LEVELS; a
-    (LEVELS+1)×(LEVELS+1) GLCM is built and the sentinel row/column is dropped.
+    Return a list of `nbins` scalar callables for regionprops_table.
 
-    Returns shape (LEVELS, LEVELS, n_distances, n_angles).
+    Each callable returns one float (the intensity fraction for that shell).
+
+    Column names
+    ------------
+    RadialDistribution_bin{i}_ch{c}
+      i=0  → outermost ring (CellProfiler "bin 1")
+      i=N-1 → centre        (CellProfiler "bin N")
+
+    Usage
+    -----
+    fns = make_radial_distribution(nbins=4, channel=0)
+    props = regionprops_table(labels, img, extra_properties=fns)
+    # columns: RadialDistribution_bin0_ch0  (outermost)
+    #          RadialDistribution_bin1_ch0
+    #          RadialDistribution_bin2_ch0
+    #          RadialDistribution_bin3_ch0  (centre)
     """
-    raw = graycomatrix(
-        img_int.astype(np.uint16),
-        distances=list(distances),
-        angles=list(angles),
-        levels=_GLCM_LEVELS + 1,
-        symmetric=True,
-        normed=False,
+    fns = []
+    for b in range(nbins):
+        def _fn(mask, intensity, _b=b, _nbins=nbins, _ch=channel):
+            return float(
+                _radial_distribution_all(mask, intensity, nbins=_nbins, channel=_ch)[_b]
+            )
+        fns.append(_named(_fn, f"RadialDistribution_bin{b}_ch{channel}"))
+    return fns
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 2. GRANULARITY  (CellProfiler: MeasureGranularity)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _granularity_all(
+    regionmask: np.ndarray,
+    intensity: np.ndarray,
+    *,
+    scales: tuple[int, ...],
+    channel: int,
+    subsample_size: int,
+    element_size: int,
+) -> np.ndarray:
+    """
+    Compute the full granularity spectrum (internal, returns array).
+
+    Algorithm (CellProfiler MeasureGranularity):
+      1. Mask the image to the object region (zero outside).
+      2. Optionally downsample so longest side ≤ subsample_size (speed).
+      3. Initialise current = masked image; record prev_mean.
+      4. For each scale S:
+           radius = round(S * element_size / 10)   [element_size=10 → radius=S]
+           opened = morphological opening with disk(radius)
+           GS[i]  = (prev_mean - curr_mean) / prev_mean
+           current = opened;  prev_mean = curr_mean
+      The spectrum captures what fraction of texture is removed at each scale.
+    """
+
+    img = intensity[..., channel] if intensity.ndim == 3 else intensity
+    img = img.astype(float)
+    mask = regionmask.astype(bool)
+    masked_img = img * mask
+
+    h, w = masked_img.shape[:2]
+    if max(h, w) > subsample_size:
+        factor = subsample_size / max(h, w)
+        nh, nw = max(1, int(round(h * factor))), max(1, int(round(w * factor)))
+        masked_img = resize(masked_img, (nh, nw), anti_aliasing=True, order=3)
+        mask = resize(mask.astype(float), (nh, nw), order=0) > 0.5
+
+    current = masked_img.copy()
+    prev_mean = current[mask].mean() if mask.any() else 0.0
+    result = np.zeros(len(scales))
+    if prev_mean == 0:
+        return result
+
+    for i, scale in enumerate(scales):
+        radius = max(1, int(round(scale * element_size / 10)))
+        se = disk(radius)
+        opened = dilation(erosion(current, se), se)
+        curr_mean = opened[mask].mean() if mask.any() else 0.0
+        result[i] = (prev_mean - curr_mean) / prev_mean if prev_mean > 0 else 0.0
+        current = opened
+        prev_mean = curr_mean
+
+    return result
+
+
+def make_granularity(
+    scales: Sequence[int] = tuple(range(1, 17)),
+    channel: int = 0,
+    subsample_size: int = 256,
+    element_size: int = 10,
+) -> list:
+    """
+    Return a list of len(scales) scalar callables for regionprops_table.
+
+    Each callable returns one float (the granularity value at that scale).
+
+    Column names
+    ------------
+    Granularity_scale{s}_ch{c}
+      s is the actual scale integer (e.g. 1, 2, … 16), not an array index.
+
+    Usage
+    -----
+    fns = make_granularity(scales=range(1, 17), channel=0)
+    props = regionprops_table(labels, img, extra_properties=fns)
+    # columns: Granularity_scale1_ch0, Granularity_scale2_ch0, …,
+    #          Granularity_scale16_ch0
+
+    Multiple channels
+    -----------------
+    fns = make_granularity(channel=0) + make_granularity(channel=1)
+    # columns for both channels in one call
+    """
+    scales = tuple(scales)
+    fns = []
+    for i, s in enumerate(scales):
+        def _fn(mask, intensity, _i=i, _s=scales, _ch=channel,
+                _sub=subsample_size, _el=element_size):
+            return float(
+                _granularity_all(mask, intensity,
+                                 scales=_s, channel=_ch,
+                                 subsample_size=_sub,
+                                 element_size=_el)[_i]
+            )
+        fns.append(_named(_fn, f"Granularity_scale{s}_ch{channel}"))
+    return fns
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 3. GLCM (Gray-Level Co-occurrence Matrix)
+#    CellProfiler: MeasureTexture
+# ════════════════════════════════════════════════════════════════════════════
+
+# Supported GLCM property names. ASM = energy² matches CellProfiler's
+# AngularSecondMoment output. All others use skimage graycoprops names directly.
+GLCM_PROPS = ("contrast", "dissimilarity", "homogeneity", "energy", "correlation", "ASM")
+
+
+def _glcm_all(
+    regionmask: np.ndarray,
+    intensity: np.ndarray,
+    *,
+    distances: tuple[int, ...],
+    angles: tuple[float, ...],
+    levels: int,
+    channel: int,
+    props: tuple[str, ...],
+) -> np.ndarray:
+    """
+    Compute all GLCM features (internal, returns flat array).
+
+    Algorithm (CellProfiler MeasureTexture):
+      1. Extract masked pixels; quantise to [0, levels-1] using min-max scaling.
+      2. Build symmetric, normalised GLCM for each distance at all angles.
+      3. For each (distance, prop): compute mean across the angle axis.
+      4. ASM = energy² (CellProfiler AngularSecondMoment convention).
+
+    Output layout (flat): [d0_p0, d0_p1, …, d0_pM, d1_p0, …, dN_pM]
+    """
+    img = intensity[..., channel] if intensity.ndim == 3 else intensity
+    img = img.astype(float)
+    mask = regionmask.astype(bool)
+
+    roi = img[mask]
+    n_out = len(distances) * len(props)
+    if roi.size == 0:
+        return np.zeros(n_out)
+
+    img_min, img_max = roi.min(), roi.max()
+    if img_max == img_min:
+        return np.zeros(n_out)
+
+    quantised = np.zeros_like(img, dtype=np.uint8)
+    quantised[mask] = np.clip(
+        ((img[mask] - img_min) / (img_max - img_min) * (levels - 1)).astype(int),
+        0, levels - 1,
     )
-    glcm = raw[:_GLCM_LEVELS, :_GLCM_LEVELS, :, :].astype(float)
-    totals = glcm.sum(axis=(0, 1), keepdims=True)
-    totals[totals == 0] = 1.0
-    return glcm / totals
+
+    results = []
+    for d in distances:
+        glcm = graycomatrix(
+            quantised,
+            distances=[d],
+            angles=list(angles),
+            levels=levels,
+            symmetric=True,
+            normed=True,
+        )
+        for p in props:
+            if p == "ASM":
+                vals = graycoprops(glcm, "energy")[0] ** 2
+            else:
+                vals = graycoprops(glcm, p)[0]
+            results.append(float(vals.mean()))   # mean over angles
+
+    return np.array(results)
 
 
-def _haralick_from_glcm(P: np.ndarray) -> np.ndarray:
+def make_glcm(
+    distances: Sequence[int] = (1, 2, 4, 8),
+    angles: Sequence[float] = (0, np.pi / 4, np.pi / 2, 3 * np.pi / 4),
+    levels: int = 8,
+    channel: int = 0,
+    props: Sequence[str] = GLCM_PROPS,
+) -> list:
     """
-    Compute 13 Haralick texture statistics from a single normalised
-    co-occurrence matrix P of shape (N, N).
+    Return a list of len(distances)*len(props) scalar callables.
 
-    Feature order matches _HARALICK_STATS and CellProfiler's MeasureTexture.
+    Each callable returns one float (one GLCM feature at one distance).
+
+    Column names
+    ------------
+    GLCM_{prop}_d{distance}_ch{c}
+      prop     ∈ {contrast, dissimilarity, homogeneity, energy, correlation, ASM}
+      distance = actual pixel offset integer (e.g. 1, 2, 4, 8)
+
+    Usage
+    -----
+    fns = make_glcm(distances=[1, 4], channel=0)
+    props = regionprops_table(labels, img, extra_properties=fns)
+    # columns (12 total):
+    #   GLCM_contrast_d1_ch0      GLCM_contrast_d4_ch0
+    #   GLCM_dissimilarity_d1_ch0 GLCM_dissimilarity_d4_ch0
+    #   GLCM_homogeneity_d1_ch0   GLCM_homogeneity_d4_ch0
+    #   GLCM_energy_d1_ch0        GLCM_energy_d4_ch0
+    #   GLCM_correlation_d1_ch0   GLCM_correlation_d4_ch0
+    #   GLCM_ASM_d1_ch0           GLCM_ASM_d4_ch0
+
+    Selecting a property subset
+    ----------------------------
+    fns = make_glcm(distances=[1], props=["contrast", "correlation"], channel=1)
+    # → GLCM_contrast_d1_ch1, GLCM_correlation_d1_ch1
     """
-    N = P.shape[0]
-    I, J = np.mgrid[0:N, 0:N]
-    px, py = P.sum(axis=1), P.sum(axis=0)
+    distances = tuple(distances)
+    angles = tuple(angles)
+    props = tuple(props)
 
-    asm      = float(np.sum(P ** 2))
-    contrast = float(np.sum((I - J) ** 2 * P))
+    fns = []
+    for di, d in enumerate(distances):
+        for pi, p in enumerate(props):
+            flat_idx = di * len(props) + pi
 
-    mu_i    = float(np.sum(I * P))
-    mu_j    = float(np.sum(J * P))
-    sigma_i = float(np.sqrt(np.sum(P * (I - mu_i) ** 2)))
-    sigma_j = float(np.sqrt(np.sum(P * (J - mu_j) ** 2)))
-    correlation = (float(np.sum(P * (I - mu_i) * (J - mu_j)) / (sigma_i * sigma_j))
-                   if sigma_i > 0 and sigma_j > 0 else 0.0)
-
-    variance = float(np.sum(P * (I - mu_i) ** 2))
-    idm      = float(np.sum(P / (1.0 + (I - J) ** 2)))
-
-    p_flat    = P.ravel()
-    p_xplusy  = np.bincount((I + J).ravel(),       weights=p_flat, minlength=2 * N - 1)
-    p_xminusy = np.bincount(np.abs(I - J).ravel(), weights=p_flat, minlength=N)
-    k_sum     = np.arange(len(p_xplusy))
-
-    sum_average  = float(np.sum(k_sum * p_xplusy))
-    nz_s         = p_xplusy > 0
-    sum_entropy  = float(-np.sum(p_xplusy[nz_s] * np.log2(p_xplusy[nz_s])))
-    # Sum variance uses sum_entropy as reference (per Haralick and CellProfiler)
-    sum_variance = float(np.sum((k_sum - sum_entropy) ** 2 * p_xplusy))
-
-    nz_P         = P > 0
-    entropy      = float(-np.sum(P[nz_P] * np.log2(P[nz_P])))
-    diff_var     = float(np.var(p_xminusy))
-    nz_d         = p_xminusy > 0
-    diff_entropy = float(-np.sum(p_xminusy[nz_d] * np.log2(p_xminusy[nz_d])))
-
-    nz_px, nz_py = px > 0, py > 0
-    hx   = float(-np.sum(px[nz_px] * np.log2(px[nz_px])))
-    hy   = float(-np.sum(py[nz_py] * np.log2(py[nz_py])))
-    outer    = np.outer(px, py)
-    outer_nz = outer > 0
-    hxy1 = float(-np.sum(P[outer_nz]     * np.log2(outer[outer_nz])))
-    hxy2 = float(-np.sum(outer[outer_nz] * np.log2(outer[outer_nz])))
-
-    denom = max(hx, hy)
-    imc1  = (entropy - hxy1) / denom if denom > 0 else 0.0
-    imc2  = float(np.sqrt(max(0.0, 1.0 - np.exp(-2.0 * (hxy2 - entropy)))))
-
-    return np.array([asm, contrast, correlation, variance, idm,
-                     sum_average, sum_variance, sum_entropy,
-                     entropy, diff_var, diff_entropy, imc1, imc2], dtype=float)
+            def _fn(mask, intensity,
+                    _idx=flat_idx, _dists=distances, _angles=angles,
+                    _levels=levels, _ch=channel, _props=props):
+                return float(
+                    _glcm_all(mask, intensity,
+                               distances=_dists, angles=_angles,
+                               levels=_levels, channel=_ch,
+                               props=_props)[_idx]
+                )
+            fns.append(_named(_fn, f"GLCM_{p}_d{d}_ch{channel}"))
+    return fns
 
 
-def glcm_feature_names(
-    channel_names: Sequence[str],
-    distances: Optional[Sequence[int]] = None,
-) -> List[str]:
+# ════════════════════════════════════════════════════════════════════════════
+# 4. MULTI-CHANNEL PEARSON CORRELATION
+#    CellProfiler: MeasureCorrelation
+#
+#    NOT passed as extra_properties — requires two channels simultaneously,
+#    which conflicts with regionprops_table's single intensity-image contract.
+#    Call this function directly alongside regionprops_table and merge results.
+# ════════════════════════════════════════════════════════════════════════════
+
+def measure_channel_correlation(
+    label_image: np.ndarray,
+    multichannel_image: np.ndarray,
+    channel_pairs: Sequence[tuple[int, int]] | None = None,
+) -> dict[str, np.ndarray]:
     """
-    Ordered feature names for GLCM output.
-
-    Pattern: ``glcm_d{dist}_{stat}_{channel}``
-
-    Channel is always last. The list is in **channels-outer** order,
-    matching what the factory function's closure returns when called with
-    a multi-channel image (all channels in one call).
+    Pearson correlation between channel pairs, per labeled object.
+    Replicates CellProfiler MeasureCorrelation (Pearson metric only).
 
     Parameters
     ----------
-    channel_names : sequence of str
-    distances : sequence of int, optional  – default ``[1, 2, 3]``
+    label_image        : (H, W) int array, 0 = background.
+    multichannel_image : (H, W, C) float array with C >= 2.
+                         For separate channel images, stack first:
+                         np.stack([img_ch0, img_ch1], axis=-1)
+    channel_pairs      : list of (a, b) tuples to correlate.
+                         Default: all unique unordered pairs (a < b).
 
     Returns
     -------
-    list of str, length = n_channels × n_distances × 13
-    """
-    if distances is None:
-        distances = _DEFAULT_DISTANCES
-    return [
-        f"glcm_{stat}_d{d}_{ch}"
-        for ch in channel_names
-        for d in distances
-        for stat in _HARALICK_STATS
-    ]
+    dict with keys:
+        "label"                           : (N,) object labels
+        "Correlation_pearson_ch{a}_ch{b}" : (N,) Pearson r, NaN if
+                                            either channel has zero variance
 
+    Usage
+    -----
+    corr = measure_channel_correlation(label_img, img)
+    df_corr = pd.DataFrame(corr)
 
-def make_glcm_func(
-    n_channels: int,
-    channel_names: Optional[Sequence[str]] = None,
-    distances: Optional[Sequence[int]] = None,
-) -> Tuple[Callable, _ColNamesEntry]:
-    """
-    Create a GLCM texture function ready for ``extra_properties``.
-
-    Parameters
-    ----------
-    n_channels : int
-        Number of intensity image channels.
-    channel_names : sequence of str, optional
-        Custom channel labels.  Defaults to ``ch0, ch1, …``.
-    distances : sequence of int, optional
-        GLCM pixel distances.  Defaults to ``[1, 2, 3]``.
-
-    Returns
-    -------
-    func : callable  – pass directly to ``extra_properties``
-    col_entry : dict – pass to :func:`rename_regionprops_table` as
-                       ``col_names["glcm"]``
+    # Merge with regionprops_table output on "label":
+    df_props = pd.DataFrame(regionprops_table(..., properties=["label", ...]))
+    df = df_props.merge(df_corr, on="label")
 
     Notes
     -----
-    skimage calls this function once per channel (with a 2-D intensity slice)
-    and stacks results.  The closure therefore processes a single channel per
-    call and returns a 1-D array of length ``n_distances × 13``.
-
-    Example
-    -------
-    ::
-
-        glcm_fn, glcm_entry = make_glcm_func(3, ["DAPI","GFP","mCherry"])
-        props  = regionprops(label_image, intensity_image=img,
-                             extra_properties=[glcm_fn])
-        # Access by attribute name (same as func.__name__):
-        feats  = props[0].glcm    # shape (n_dist*13, n_channels)
-
-        # Or via regionprops_table + rename:
-        raw = regionprops_table(label_image, intensity_image=img,
-                                extra_properties=[glcm_fn])
-        df  = rename_regionprops_table(raw, {"glcm": glcm_entry})
+    - CellProfiler computes Pearson on raw pixel intensities inside the mask
+      with no prior normalisation. This implementation matches that behaviour.
+    - Why not extra_properties?
+      regionprops_table passes a single intensity image to each callable.
+      Pearson correlation requires two channels simultaneously, so it cannot
+      fit the (regionmask, intensity) -> scalar signature without external
+      state. The standalone function + merge pattern is cleaner and explicit.
     """
-    if distances is None:
-        distances = _DEFAULT_DISTANCES
-    ch_names = _resolve_channel_names(n_channels, channel_names)
-    _distances = list(distances)
-    n_feat_per_ch = len(_distances) * len(_HARALICK_STATS)
+    if multichannel_image.ndim != 3:
+        raise ValueError(
+            "multichannel_image must be (H, W, C). "
+            "Stack channels: np.stack([ch0, ch1], axis=-1)."
+        )
+    n_channels = multichannel_image.shape[2]
 
-    def glcm(image: np.ndarray, intensity_image: np.ndarray) -> np.ndarray:
-        # skimage passes a single-channel 2-D slice when intensity_image is multichannel.
-        # The function also works when called manually with a full multichannel image.
-        mask     = image.astype(bool)
-        channels = _split_channels(intensity_image)
-
-        if not mask.any():
-            return np.zeros(len(channels) * n_feat_per_ch, dtype=float)
-
-        out: List[float] = []
-        for ch_img in channels:
-            img_int  = _normalize_channel(ch_img, mask)
-            glcm_mat = _masked_glcm(img_int, _distances, _GLCM_ANGLES)
-            for d_idx in range(len(_distances)):
-                P_avg = glcm_mat[:, :, d_idx, :].mean(axis=-1)  # average over 4 angles
-                out.extend(_haralick_from_glcm(P_avg).tolist())
-        return np.array(out, dtype=float)
-
-    glcm.__name__ = "glcm"
-
-    col_entry: _ColNamesEntry = {
-        "names":      glcm_feature_names(ch_names, _distances),
-        "n_features": n_feat_per_ch,
-        "n_channels": n_channels,
-    }
-    return glcm, col_entry
-
-
-# ===========================================================================
-# Section 2 – Granularity  (matches CellProfiler MeasureGranularity)
-# ===========================================================================
-
-def _granularity_single_channel(
-    img: np.ndarray,
-    mask: np.ndarray,
-    background_radius: int,
-    spectrum_length: int,
-    subsample_size: float,
-) -> np.ndarray:
-    """CellProfiler granularity algorithm for a single intensity channel."""
-    img = img.astype(float)
-    img[~mask] = 0.0
-
-    if 0.0 < subsample_size < 1.0:
-        from skimage.transform import rescale
-        img  = rescale(img,  subsample_size, anti_aliasing=True,  channel_axis=None)
-        mask = rescale(mask.astype(float), subsample_size,
-                       anti_aliasing=False, channel_axis=None) > 0.5
-        bg_r = max(1, round(background_radius * subsample_size))
-    else:
-        bg_r = background_radius
-
-    if bg_r > 0:
-        img = np.clip(img - opening(img, disk(bg_r)), 0.0, None)
-    img[~mask] = 0.0
-
-    image_total = float(img.sum())
-    if image_total == 0.0:
-        return np.zeros(spectrum_length, dtype=float)
-
-    spectrum   = np.zeros(spectrum_length, dtype=float)
-    prev_total = image_total
-    current    = img.copy()
-
-    for n in range(1, spectrum_length + 1):
-        eroded  = erosion(current, disk(n))
-        rebuilt = reconstruction(eroded, current, method="dilation")
-        rebuilt[~mask] = 0.0
-        curr_total      = float(rebuilt.sum())
-        spectrum[n - 1] = 100.0 * (prev_total - curr_total) / image_total
-        prev_total      = curr_total
-        current         = rebuilt   # iterative: each step works on the rebuilt image
-
-    return spectrum
-
-
-def granularity_feature_names(
-    channel_names: Sequence[str],
-    spectrum_length: int = 16,
-) -> List[str]:
-    """
-    Ordered feature names for granularity output.
-
-    Pattern: ``granularity_scale_{n:02d}_{channel}``
-    """
-    return [
-        f"granularity_scale_{n:02d}_{ch}"
-        for ch in channel_names
-        for n in range(1, spectrum_length + 1)
-    ]
-
-
-def make_granularity_func(
-    n_channels: int,
-    channel_names: Optional[Sequence[str]] = None,
-    background_radius: int = 10,
-    spectrum_length: int = 16,
-    subsample_size: float = 0.25,
-) -> Tuple[Callable, _ColNamesEntry]:
-    """
-    Create a granularity function ready for ``extra_properties``.
-
-    Parameters
-    ----------
-    n_channels : int
-    channel_names : sequence of str, optional
-    background_radius : int
-        Disk radius for morphological background subtraction
-        (CellProfiler default: 10).
-    spectrum_length : int
-        Number of granularity scales to compute (CellProfiler default: 16).
-    subsample_size : float
-        Linear subsampling factor applied before computation for speed.
-        CellProfiler default: 0.25.  Use ``1.0`` to disable.
-
-    Returns
-    -------
-    func : callable
-    col_entry : dict
-    """
-    ch_names = _resolve_channel_names(n_channels, channel_names)
-    _bgr, _sl, _ss = background_radius, spectrum_length, subsample_size
-
-    def granularity(image: np.ndarray, intensity_image: np.ndarray) -> np.ndarray:
-        mask     = image.astype(bool)
-        channels = _split_channels(intensity_image)
-        if not mask.any():
-            return np.zeros(len(channels) * _sl, dtype=float)
-        spectra = [
-            _granularity_single_channel(ch.copy(), mask.copy(), _bgr, _sl, _ss)
-            for ch in channels
+    if channel_pairs is None:
+        channel_pairs = [
+            (a, b) for a in range(n_channels) for b in range(a + 1, n_channels)
         ]
-        return np.concatenate(spectra).astype(float)
 
-    granularity.__name__ = "granularity"
+    labels = np.unique(label_image)
+    labels = labels[labels != 0]
+    n_objects = len(labels)
 
-    col_entry: _ColNamesEntry = {
-        "names":      granularity_feature_names(ch_names, spectrum_length),
-        "n_features": spectrum_length,
-        "n_channels": n_channels,
-    }
-    return granularity, col_entry
+    result: dict[str, np.ndarray] = {"label": labels}
 
+    for a, b in channel_pairs:
+        ch_a = multichannel_image[..., a].astype(float)
+        ch_b = multichannel_image[..., b].astype(float)
+        pearson = np.full(n_objects, np.nan)
 
-# ===========================================================================
-# Section 3 – Radial distribution  (matches MeasureObjectRadialDistribution)
-# ===========================================================================
+        for i, lbl in enumerate(labels):
+            mask = label_image == lbl
+            va, vb = ch_a[mask], ch_b[mask]
+            if va.std() > 0 and vb.std() > 0:
+                pearson[i] = float(np.corrcoef(va, vb)[0, 1])
 
-def _distance_map_from_centroid(mask: np.ndarray) -> Tuple[np.ndarray, float]:
-    rows, cols = np.nonzero(mask)
-    r_grid, c_grid = np.mgrid[0:mask.shape[0], 0:mask.shape[1]]
-    dist_map = np.sqrt((r_grid - rows.mean()) ** 2 + (c_grid - cols.mean()) ** 2)
-    return dist_map, max(float(dist_map[mask].max()), 1.0)
+        result[f"Correlation_pearson_ch{a}_ch{b}"] = pearson
 
-
-def _radial_single_channel(
-    img: np.ndarray,
-    mask: np.ndarray,
-    norm_dist: np.ndarray,
-    n_bins: int,
-) -> np.ndarray:
-    """
-    Compute FracAtD, MeanFrac, RadialCV per radial bin for a single channel.
-    """
-    img   = img.astype(float)
-    total = float(img[mask].sum())
-    n_px  = int(mask.sum())
-    edges = np.linspace(0.0, 1.0, n_bins + 1)
-    out   = np.zeros(n_bins * 3, dtype=float)
-
-    for b in range(n_bins):
-        lo, hi    = edges[b], edges[b + 1]
-        in_hi     = (norm_dist <= hi) if b == n_bins - 1 else (norm_dist < hi)
-        ring      = mask & (norm_dist >= lo) & in_hi
-        pixels    = img[ring]
-        n_ring    = len(pixels)
-
-        frac_at_d = float(pixels.sum()) / total if total > 0 else 0.0
-        area_frac = n_ring / n_px if n_px > 0 else 0.0
-        mean_frac = frac_at_d / area_frac if area_frac > 0 else 0.0
-        mu        = pixels.mean() if n_ring > 0 else 0.0
-        radial_cv = (pixels.std() / mu) if (n_ring > 1 and mu > 0) else 0.0
-
-        out[b * 3: b * 3 + 3] = [frac_at_d, mean_frac, radial_cv]
-
-    return out
+    return result
 
 
-def radial_feature_names(
-    channel_names: Sequence[str],
-    n_bins: int = 4,
-) -> List[str]:
-    """
-    Ordered feature names for radial distribution output.
+# ════════════════════════════════════════════════════════════════════════════
+# EFFICIENCY NOTE: avoiding redundant recomputation
+# ════════════════════════════════════════════════════════════════════════════
+"""
+Each scalar callable in a make_* list recomputes the full underlying array
+(e.g. all GLCM features for all distances) every time it is called for one
+object. regionprops_table calls each extra_property separately, so for N
+callables per object this triggers N full recomputations.
 
-    Pattern: ``radial_{stat}_bin{b}_{channel}``
-    where ``stat`` ∈ {frac_at_d, mean_frac, radial_cv}.
-    """
-    stats = ["frac_at_d", "mean_frac", "radial_cv"]
-    return [
-        f"radial_{stat}_bin{b}_{ch}"
-        for ch in channel_names
-        for b in range(n_bins)
-        for stat in stats
-    ]
+For typical cell biology datasets (cells < 200 px diameter, < 1000 objects)
+the overhead is negligible. For larger datasets, wrap with a per-call cache:
 
+    _cache: dict = {}
 
-def make_radial_func(
-    n_channels: int,
-    channel_names: Optional[Sequence[str]] = None,
-    n_bins: int = 5,
-) -> Tuple[Callable, _ColNamesEntry]:
-    """
-    Create a radial-distribution function ready for ``extra_properties``.
+    def _cached_glcm(mask, intensity, *, key, **kw):
+        obj_id = id(mask)   # regionmask is a new array per object
+        # Better: hash mask bytes
+        h = hash(mask.tobytes())
+        if h not in _cache:
+            _cache[h] = _glcm_all(mask, intensity, **kw)
+        return _cache[h]
 
-    Parameters
-    ----------
-    n_channels : int
-    channel_names : sequence of str, optional
-    n_bins : int
-        Number of concentric radial bins (CellProfiler default: 4).
-
-    Returns
-    -------
-    func : callable
-    col_entry : dict
-    """
-    ch_names  = _resolve_channel_names(n_channels, channel_names)
-    _n_bins   = n_bins
-    n_feat_pc = n_bins * 3
-
-    def radial_distribution(image: np.ndarray, intensity_image: np.ndarray) -> np.ndarray:
-        mask     = image.astype(bool)
-        channels = _split_channels(intensity_image)
-        if not mask.any():
-            return np.zeros(len(channels) * n_feat_pc, dtype=float)
-        dist_map, max_dist = _distance_map_from_centroid(mask)
-        norm_dist = dist_map / max_dist
-        results = [_radial_single_channel(ch, mask, norm_dist, _n_bins) for ch in channels]
-        return np.concatenate(results).astype(float)
-
-    radial_distribution.__name__ = "radial_distribution"
-
-    col_entry: _ColNamesEntry = {
-        "names":      radial_feature_names(ch_names, n_bins),
-        "n_features": n_feat_pc,
-        "n_channels": n_channels,
-    }
-    return radial_distribution, col_entry
+    # Clear between regionprops_table calls:
+    _cache.clear()
+    props = regionprops_table(...)
+"""
 
 
-# ===========================================================================
-# Main public API
-# ===========================================================================
+# ════════════════════════════════════════════════════════════════════════════
+# USAGE EXAMPLE
+# ════════════════════════════════════════════════════════════════════════════
 
-
-# Shorthand string keys accepted by profile_image / profile_object.
-_EXTRA_PROPERTIES_KEYS = frozenset({"glcm", "radial", "granularity"})
-
-def build_extra_properties(
-    extra_properties: Optional[List[Union[str, Callable]]],
-    n_channels: int,
-    channels: List[str],
-    extra_properties_kwargs: Optional[List[Optional[Dict]]] = None,
-) -> tuple:
-    """Build extra-property callables and their col_names metadata.
-
-    Accepts a mix of shorthand strings (``'glcm'``, ``'radial'``,
-    ``'granularity'``) and plain callables.  Strings are expanded into
-    factory-built closures so they receive the correct ``n_channels`` and
-    ``channels`` automatically.
-
-    Parameters
-    ----------
-    extra_properties : list of str or callable, optional
-        Each item is either a shorthand string or a ready-made callable.
-    n_channels : int
-        Number of image channels (needed by the factory functions).
-    channels : list of str
-        Channel names (needed by the factory functions for column naming).
-    extra_properties_kwargs : list of dict or None, optional
-        Per-item keyword arguments forwarded to string-based factory functions.
-        Ignored for plain callables.  Use ``None`` entries as placeholders.
-
-    Returns
-    -------
-    callables : list of callable or None
-    col_names : dict or None
-        Combined column-name metadata from all factory functions;
-        ``None`` when no string shortcuts were used.
-    """
-    if not extra_properties:
-        return None, None
-
-    if extra_properties_kwargs is None:
-        extra_properties_kwargs = [None] * len(extra_properties)
-
-    callables: List[Callable] = []
-    col_names: Dict = {}
-
-    for prop, kwargs in zip(extra_properties, extra_properties_kwargs):
-        kw = kwargs or {}
-
-        if isinstance(prop, str):
-            if prop not in _EXTRA_PROPERTIES_KEYS:
-                raise ValueError(
-                    f"Unknown extra property shorthand: '{prop}'. "
-                    f"Available: {sorted(_EXTRA_PROPERTIES_KEYS)}"
-                )
-            if prop == "glcm":
-                fn, entry = make_glcm_func(n_channels, channels, **kw)
-                col_names["glcm"] = entry
-            elif prop == "granularity":
-                fn, entry = make_granularity_func(n_channels, channels, **kw)
-                col_names["granularity"] = entry
-            elif prop == "radial":
-                fn, entry = make_radial_func(n_channels, channels, **kw)
-                col_names["radial_distribution"] = entry
-            callables.append(fn)
-
-        elif callable(prop):
-            callables.append(prop)
-
-        else:
-            raise TypeError(
-                f"extra_properties items must be strings or callables, got {type(prop)}"
-            )
-
-    return (callables or None), (col_names or None)
-
-
-def rename_regionprops_table(
-    raw: Dict[str, np.ndarray],
-    col_names: Dict[str, _ColNamesEntry],
-) -> pd.DataFrame:
-    """
-    Convert the raw ``regionprops_table`` dict to a tidy DataFrame with
-    descriptive column names.
-
-    skimage names extra-property outputs differently depending on whether
-    the function returns a scalar, 1-D array, or 2-D array:
-
-    * scalar         → ``{func_name}``
-    * 1-D (len N)   → ``{func_name}-0`` … ``{func_name}-{N-1}``
-    * 2-D (M × C)  → ``{func_name}-0-0`` … ``{func_name}-{M-1}-{C-1}``
-
-    When ``intensity_image`` is multichannel (H×W×C), skimage calls each
-    extra-property function **once per channel** and stacks the results into
-    a 2-D array (n_features_per_channel × n_channels), so the 2-D naming
-    scheme applies.
-
-    This function handles both cases automatically.
-
-    Parameters
-    ----------
-    raw : dict
-        Direct output of ``skimage.measure.regionprops_table``.
-    col_names : dict
-        The ``col_names`` dict from :func:`build_extra_properties`, or a
-        manually assembled dict of the same structure.
-
-    Returns
-    -------
-    pd.DataFrame
-        One row per region, with human-readable column names.
-    """
+if __name__ == "__main__":
     import pandas as pd
+    from skimage.measure import regionprops_table
+    from skimage.draw import disk as draw_disk
 
-    rename_map: Dict[str, str] = {}
+    rng = np.random.default_rng(42)
+    H, W, C = 128, 128, 3
+    img = rng.random((H, W, C)).astype(np.float32)
 
-    for func_name, entry in col_names.items():
-        names: List[str]  = entry["names"]       # channels-outer flat list
-        n_feat: int       = entry["n_features"]  # features per channel
-        n_ch: int         = entry["n_channels"]  # number of channels
+    label_img = np.zeros((H, W), dtype=int)
+    for obj_id, (cy, cx, r) in enumerate([(32, 32, 18), (90, 80, 22)], start=1):
+        rr, cc = draw_disk((cy, cx), r, shape=(H, W))
+        label_img[rr, cc] = obj_id
 
-        for feat_idx in range(n_feat):
-            for ch_idx in range(n_ch):
-                # skimage 2-D stacked key: {func}-{feat_idx}-{ch_idx}
-                key_2d = f"{func_name}-{feat_idx}-{ch_idx}"
-                # Flat list is channels-outer: names[ch_idx * n_feat + feat_idx]
-                friendly = names[ch_idx * n_feat + feat_idx]
-                if key_2d in raw:
-                    rename_map[key_2d] = friendly
+    # ── 1. Radial distribution ────────────────────────────────────────────
+    # 4 bins, channel 0
+    rad_fns = make_radial_distribution(nbins=4, channel=0)
+    # → RadialDistribution_bin0_ch0 … RadialDistribution_bin3_ch0
 
-            # Also handle 1-D case (single channel or manual call)
-            key_1d = f"{func_name}-{feat_idx}"
-            if key_1d in raw:
-                rename_map[key_1d] = names[feat_idx]
+    # ── 2. Granularity ────────────────────────────────────────────────────
+    # scales 1–8, channels 0 and 1 together
+    gran_fns = make_granularity(scales=range(1, 9), channel=0) \
+             + make_granularity(scales=range(1, 9), channel=1)
+    # → Granularity_scale1_ch0 … scale8_ch0,
+    #   Granularity_scale1_ch1 … scale8_ch1
 
-    return pd.DataFrame(raw).rename(columns=rename_map)
+    # ── 3. GLCM ───────────────────────────────────────────────────────────
+    # All 6 props at distances 1 & 4, channel 0
+    glcm_fns = make_glcm(distances=[1, 4], channel=0)
+    # → GLCM_contrast_d1_ch0, …, GLCM_ASM_d1_ch0,
+    #   GLCM_contrast_d4_ch0, …, GLCM_ASM_d4_ch0
 
+    # Subset of props, channel 1
+    glcm_fns_ch1 = make_glcm(distances=[1], props=["contrast", "correlation"], channel=1)
+    # → GLCM_contrast_d1_ch1, GLCM_correlation_d1_ch1
 
-# # ===========================================================================
-# # Demo / self-test  (python cellprofiler_regionprops.py)
-# # ===========================================================================
+    # ── Assemble and run ──────────────────────────────────────────────────
+    extra = rad_fns + gran_fns + glcm_fns + glcm_fns_ch1
 
-# if __name__ == "__main__":
-#     import pandas as pd
-#     from skimage.measure import regionprops, regionprops_table
+    props = regionprops_table(
+        label_img,
+        img,
+        properties=["label", "area"],
+        extra_properties=extra,
+    )
+    df = pd.DataFrame(props)
+    print("\n=== regionprops_table columns ===")
+    for col in df.columns:
+        print(" ", col)
 
-#     print("=" * 65)
-#     print("cellprofiler_regionprops – demo")
-#     print("=" * 65)
+    # ── 4. Pearson correlation (separate call, then merge) ────────────────
+    corr = measure_channel_correlation(
+        label_img,
+        img,
+        channel_pairs=[(0, 1), (0, 2), (1, 2)],
+    )
+    df_corr = pd.DataFrame(corr)
+    # → columns: label, Correlation_pearson_ch0_ch1,
+    #             Correlation_pearson_ch0_ch2, Correlation_pearson_ch1_ch2
 
-#     np.random.seed(42)
-#     H, W, C = 128, 128, 3
-#     CHANNEL_NAMES = ["DAPI", "GFP", "mCherry"]
-
-#     # Synthetic label image: two circular objects
-#     label_image = np.zeros((H, W), dtype=np.int32)
-#     yy, xx = np.ogrid[:H, :W]
-#     label_image[(yy - 32) ** 2 + (xx - 32) ** 2 < 20 ** 2] = 1
-#     label_image[(yy - 90) ** 2 + (xx - 90) ** 2 < 25 ** 2] = 2
-
-#     # Synthetic 3-channel image (DAPI has a radial gradient, others are noise)
-#     intensity = (np.random.rand(H, W, C) * 0.1).astype(np.float32)
-#     intensity[:, :, 0] += np.exp(
-#         -np.sqrt((yy - 32) ** 2 + (xx - 32) ** 2) / 15.0).astype(np.float32)
-
-#     # ------------------------------------------------------------------
-#     # Demo 1: build_extra_properties → regionprops_table → rename
-#     # ------------------------------------------------------------------
-#     print("\n[Demo 1]  build_extra_properties  +  regionprops_table  +  rename")
-#     print("-" * 65)
-
-#     extra_props, col_names = build_extra_properties(
-#         n_channels=C,
-#         channel_names=CHANNEL_NAMES,
-#         glcm_distances=[1, 2],
-#         granularity_spectrum_length=8,
-#         granularity_subsample_size=1.0,   # disable subsampling for speed in demo
-#         radial_n_bins=3,
-#     )
-
-#     raw = regionprops_table(
-#         label_image,
-#         intensity_image=intensity,
-#         properties=["label", "area"],
-#         extra_properties=extra_props,
-#     )
-
-#     df = rename_regionprops_table(raw, col_names)
-
-#     print(f"  DataFrame shape : {df.shape}")
-#     glcm_c = [c for c in df.columns if c.startswith("glcm")]
-#     gran_c = [c for c in df.columns if c.startswith("gran")]
-#     rad_c  = [c for c in df.columns if c.startswith("radial")]
-#     print(f"  GLCM cols       : {glcm_c[:4]} …  (total {len(glcm_c)})")
-#     print(f"  Granularity cols: {gran_c[:4]} …  (total {len(gran_c)})")
-#     print(f"  Radial cols     : {rad_c[:4]}  …  (total {len(rad_c)})")
-#     print(f"\n  Sample rows (first 2 GLCM cols):\n{df[['label','area'] + glcm_c[:2]].to_string(index=False)}")
-
-#     # ------------------------------------------------------------------
-#     # Demo 2: individual factories → regionprops (attribute access)
-#     # ------------------------------------------------------------------
-#     print("\n\n[Demo 2]  Individual make_*_func factories  +  regionprops()")
-#     print("-" * 65)
-
-#     glcm_fn,   glcm_entry   = make_glcm_func(C, CHANNEL_NAMES, distances=[1])
-#     gran_fn,   gran_entry   = make_granularity_func(C, CHANNEL_NAMES,
-#                                                     spectrum_length=4, subsample_size=1.0)
-#     radial_fn, radial_entry = make_radial_func(C, CHANNEL_NAMES, n_bins=2)
-
-#     props = regionprops(
-#         label_image,
-#         intensity_image=intensity,
-#         extra_properties=[glcm_fn, gran_fn, radial_fn],
-#     )
-
-#     for r in props:
-#         print(f"\n  Region {r.label}  (area={r.area} px):")
-#         print(f"    r.glcm               shape={r.glcm.shape}")
-#         print(f"    r.granularity        shape={r.granularity.shape}")
-#         print(f"    r.radial_distribution shape={r.radial_distribution.shape}")
-
-#     print("\n  GLCM col names (first 6)   :", glcm_entry["names"][:6])
-#     print("  Granularity col names      :", gran_entry["names"])
-#     print("  Radial col names           :", radial_entry["names"])
-
-#     # ------------------------------------------------------------------
-#     # Demo 3: default channel names (no channel_names argument)
-#     # ------------------------------------------------------------------
-#     print("\n\n[Demo 3]  Default channel names (no channel_names arg)")
-#     print("-" * 65)
-#     _, default_glcm = make_glcm_func(n_channels=C, distances=[1])
-#     print("  First 6 GLCM cols:", default_glcm["names"][:6])
-
-#     print("\nAll demos passed.")
+    df_full = df.merge(df_corr, on="label")
+    print("\n=== All columns after merge ===")
+    for col in df_full.columns:
+        print(" ", col)
+    print()
+    print(df_full.T.to_string())

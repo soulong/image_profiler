@@ -1,16 +1,11 @@
 """ImageDataset class for managing microscopy image datasets."""
 
-from __future__ import annotations
-
-import re
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
-from natsort import natsorted
-from torch import isin
 from tqdm import tqdm
 from scipy import ndimage
 
@@ -26,36 +21,16 @@ from image_profiler.utils.crop import crop_cell
 from image_profiler.preprocessing.correction import fit_basic_models, transform_basic_models
 from image_profiler.preprocessing.split_tile import tile_images_from_metadata
 from image_profiler.preprocessing.z_projection import z_project_dataset
-from image_profiler.analysis.image_profiling import profile_image_single_row
-from image_profiler.analysis.object_profiling import profile_object_single_row
-from image_profiler.analysis.extra_properties import build_extra_properties
+from image_profiler.analysis.image_profiling import measure_image
+from image_profiler.analysis.object_profiling import measure_objects
 
 
 class ImageDataset:
-    """Central data structure for managing multi-well plate image datasets.
+    """Central data structure for managing multi-well plate image datasets."""
 
-    Attributes
-    ----------
-    measurement_dir : Path
-        Directory containing the measurement images.
-    image_pattern : str
-        Regex pattern for parsing image filenames.
-    mask_pattern : str
-        Regex pattern for parsing mask filenames (with _cp_masks_ suffix).
-    metadata : pd.DataFrame
-        Metadata table with one row per unique imaging site.
-    intensity_colnames : list of str
-        Column names for intensity images.
-    mask_colnames : list of str
-        Column names for mask images.
-    img_shape : tuple of int
-        Target image shape (height, width) for all 2D single-channel images.
-    img_dtype : type
-        Target data type for images (np.uint8, np.uint16, or np.float32/np.float64).
-    """
     DEFAULT_IMAGE_PATTERN = (
-    r"r(?P<row>.*)c(?P<column>.*)f(?P<field>.*)p(?P<stack>.*)-ch(?P<channel>.*)sk(?P<timepoint>[0-9]{1,})fk1fl1"
-    r".tiff"
+        r"r(?P<row>.*)c(?P<column>.*)f(?P<field>.*)p(?P<stack>.*)-ch(?P<channel>.*)sk(?P<timepoint>[0-9]{1,})fk1fl1"
+        r".tiff"
     )
 
     DEFAULT_MASK_PATTERN = (
@@ -63,8 +38,6 @@ class ImageDataset:
         r"_cp_masks_(?P<mask_name>.*)"
         r".png"
     )
-
-    VALID_DTYPES = (np.uint8, np.uint16, np.float32, np.float64)
 
     def __init__(
         self,
@@ -75,25 +48,6 @@ class ImageDataset:
         img_shape: Optional[tuple] = None,
         img_dtype: Optional[type] = None
     ) -> None:
-        """Initialize ImageDataset for 2D single-channel images.
-
-        Parameters
-        ----------
-        measurement_dir : str or Path
-            Path to measurement directory containing Images folder.
-        image_pattern : str, optional
-            Custom regex pattern for image filenames.
-        mask_pattern : str, optional
-            Custom regex pattern for mask filenames (with _cp_masks_ suffix).
-        dataset_kwargs : dict, optional
-            Additional arguments for build_metadata.
-        img_shape : tuple of int, optional
-            Target image shape (height, width) for 2D single-channel images.
-            If None, will be auto-detected from the first image.
-        img_dtype : type, optional
-            Target data type for images (np.uint8, np.uint16, np.float32, np.float64).
-            If None, will be auto-detected from the first image.
-        """
         self.measurement_dir = Path(measurement_dir)
         self.image_pattern = image_pattern or self.DEFAULT_IMAGE_PATTERN
         self.mask_pattern = mask_pattern or self.DEFAULT_MASK_PATTERN
@@ -102,148 +56,82 @@ class ImageDataset:
         self._metadata: Optional[pd.DataFrame] = None
         self._intensity_colnames: Optional[List[str]] = None
         self._mask_colnames: Optional[List[str]] = None
-
         self._img_shape: Optional[tuple] = img_shape
         self._img_dtype: Optional[type] = img_dtype
 
         self.build_metadata()
         self._auto_detect_image_properties()
+        print(self.__repr__())
 
     def __repr__(self) -> str:
-        """Return string representation."""
-        img_shape_str = f"{self._img_shape}" if self._img_shape is not None else "auto"
-        img_dtype_str = f"{self._img_dtype}" if self._img_dtype is not None else "auto"
         return (
             f"\n--------- ImageDataset ----------\n"
-            f"# dir={self.measurement_dir!r}\n"
-            f" - image_pattern:\n{self.image_pattern!r}\n"
-            f" - mask_pattern:\n{self.mask_pattern!r}\n"
-            f" - metadata_colnames: {(self.metadata.columns.to_list()) if self._metadata is not None else ''}\n"
+            f" - dir: {self.measurement_dir!r}\n"
             f" - intensity_colnames: {self._intensity_colnames}\n"
             f" - mask_colnames: {self._mask_colnames}\n"
-            f" - img_shape: {img_shape_str}\n"
-            f" - img_dtype: {img_dtype_str}\n"
+            f" - img_shape: {self._img_shape}\n"
+            f" - img_dtype: {self._img_dtype}\n"
             f" - rows: {len(self.metadata) if self._metadata is not None else 0}"
             f"\n-----------------------------------\n"
         )
 
     def __len__(self) -> int:
-        """Return number of rows in metadata."""
         return len(self.metadata)
 
     def __iter__(self) -> Iterator[tuple]:
-        """Iterate over all image sets in metadata.
-
-        Yields
-        ------
-        tuple
-            (image_data, mask_data) for each row.
-        """
         for idx in range(len(self)):
             yield self.get_imageset(idx)
 
     @property
     def metadata(self) -> pd.DataFrame:
-        """Get metadata DataFrame."""
         return self._metadata
 
     @property
     def intensity_colnames(self) -> List[str]:
-        """Get intensity column names."""
         return self._intensity_colnames or []
 
     @property
     def mask_colnames(self) -> List[str]:
-        """Get mask column names."""
         return self._mask_colnames or []
 
     @property
-    def channels(self) -> List[str]:
-        """Alias for intensity_colnames."""
-        return self.intensity_colnames
-
-    @property
-    def masks(self) -> List[str]:
-        """Alias for mask_colnames."""
-        return self.mask_colnames
-
-    @property
     def dataset_dir(self) -> Path:
-        """Alias for measurement_dir for compatibility."""
         return self.measurement_dir
 
     @property
     def img_shape(self) -> Optional[tuple]:
-        """Get target image shape (height, width)."""
         return self._img_shape
 
     @img_shape.setter
     def img_shape(self, value: Optional[tuple]) -> None:
-        """Set target image shape.
-
-        Parameters
-        ----------
-        value : tuple of int or None
-            Target shape as (height, width).
-        """
         self._img_shape = tuple(value) if value is not None else None
 
     @property
     def img_dtype(self) -> Optional[type]:
-        """Get target image data type."""
         return self._img_dtype
 
     @img_dtype.setter
     def img_dtype(self, value: Optional[type]) -> None:
-        """Set target image data type.
-
-        Parameters
-        ----------
-        value : type or None
-            Target dtype (np.uint8, np.uint16, np.float32, or np.float64).
-        """
         self._img_dtype = value
 
     def _auto_detect_image_properties(self) -> None:
-        """Auto-detect img_shape and img_dtype from the first available image.
-
-        Reads the first available 2D single-channel intensity image to extract
-        shape and dtype information. Prints detailed speculation information.
-        """
-        first_image = None
-        first_path = None
-
-        for idx in range(len(self._metadata)):
-            row = self._metadata.iloc[idx]
-            for ch_col in self._intensity_colnames:
-                img_path = Path(row["directory"]) / row[ch_col]
-                first_image = iio.imread(img_path)
-                first_path = img_path
-                break
-            break
-
+        row = self._metadata.iloc[0]
+        img_path = Path(row["directory"]) / row[self._intensity_colnames[0]]
+        # print(img_path)
+        first_image = iio.imread(img_path)
         detected_shape = first_image.shape
         detected_dtype = first_image.dtype
-
         h, w = detected_shape[0], detected_shape[1]
-
-        self._img_shape = (h, w)
-        print(f"[Auto-detect] img_shape set to {self._img_shape} "
-              f"(from first channel of row 0, file: {first_path.name})")
-
         dtype_mapping = {
             np.dtype('uint8'): np.uint8,
             np.dtype('uint16'): np.uint16,
             np.dtype('float32'): np.float32,
             np.dtype('float64'): np.float64,
         }
+        self._img_shape = (h, w)
         self._img_dtype = dtype_mapping.get(detected_dtype, np.uint16)
 
-        print(f"[Auto-detect] img_dtype set to {self._img_dtype} "
-              f"(detected: {detected_dtype}, from first channel of row 0)")
-
     def build_metadata(self, remove_na_row=True, **dataset_kwargs) -> None:
-        """Build metadata by scanning image directory."""
         self.meta_dict = images_to_dataset(
             self.measurement_dir,
             self.image_pattern,
@@ -251,63 +139,12 @@ class ImageDataset:
             remove_na_row=remove_na_row,
             **dataset_kwargs
         )
-
         self._metadata = self.meta_dict.get('metadata')
         self._intensity_colnames = self.meta_dict.get('intensity_colnames', [])
         self._mask_colnames = self.meta_dict.get('mask_colnames', [])
 
-        print(self.__repr__())
 
-    def export_dataloader(
-        self,
-        remove_na_rows: bool = True,
-        output_path: Optional[Union[str, Path]] = None
-    ) -> Path:
-        """Export metadata to CellProfiler-compatible CSV format.
-
-        Parameters
-        ----------
-        remove_na_rows : bool, optional
-            Whether to remove rows with missing intensity or mask values.
-        output_path : str or Path, optional
-            Output CSV path. Default: measurement_dir/dataloader.csv.
-
-        Returns
-        -------
-        pd.DataFrame
-            Converted DataFrame.
-        """
-        metadata_dataloader = self._metadata.dropna(
-            subset=self.intensity_colnames + self.mask_colnames
-        )
-
-        output_path = output_path or self.measurement_dir / "dataloader.csv"
-
-        write_dataloader(
-            metadata_dataloader,
-            self.intensity_colnames,
-            self.mask_colnames,
-            str(output_path)
-        )
-        return metadata_dataloader
-
-    def get_imageset(self, row_idx: int, channels: list[str] = None, masks: list[str] = None) -> tuple:
-        """Get image data and masks for a specific row.
-
-        Parameters
-        ----------
-        row_idx : int
-            Row index in metadata.
-        channels : list[str]
-            return selected channels intensity, if None, get all channels
-        masks : list[str]
-            return selected masks intensity, if None, get all masks
-        Returns
-        -------
-        tuple
-            (image_data, mask_data) where image_data is 3D np.ndarray (C, Y, X)
-            and mask_data is dict of 2D np.ndarray. All masks are resized using zoom transformations to match img_shape.
-        """
+    def get_imageset(self, row_idx: int, channels: List[str] = None, masks: List[str] = None) -> tuple:
         row = self.metadata.iloc[row_idx]
 
         image_paths = []
@@ -329,7 +166,8 @@ class ImageDataset:
             img = self._zoom_resize_image(img, is_mask=False)
             images.append(img)
 
-        image_data = np.stack(images, axis=0)
+        # Stack images as (Y, X, C) format - channels last
+        image_data = np.stack(images, axis=-1)
 
         mask_data = {}
         for name, path in mask_paths.items():
@@ -339,27 +177,7 @@ class ImageDataset:
 
         return image_data, mask_data
 
-    def _zoom_resize_image(
-        self,
-        image: np.ndarray,
-        is_mask: bool = False
-    ) -> np.ndarray:
-        """Resize a 2D single-channel image using zoom transformation.
-
-        Parameters
-        ----------
-        image : np.ndarray
-            Input 2D single-channel image array with shape (H, W).
-        is_mask : bool, optional
-            Whether the image is a mask. Uses nearest-neighbor (order=0) for masks
-            to preserve label integrity, bilinear (order=1) for intensity images.
-            Default is False.
-
-        Returns
-        -------
-        np.ndarray
-            Resized 2D image with shape matching img_shape.
-        """
+    def _zoom_resize_image(self, image: np.ndarray, is_mask: bool = False) -> np.ndarray:
         target_h, target_w = self._img_shape
         current_h, current_w = image.shape
 
@@ -367,11 +185,10 @@ class ImageDataset:
         zoom_w = target_w / current_w
 
         order = 0 if is_mask else 1
-
         resized = ndimage.zoom(image, (zoom_h, zoom_w), order=order)
 
         return resized.astype(self._img_dtype)
-
+    
     def segmentate(
         self,
         object_name: str = 'cell',
@@ -445,7 +262,6 @@ class ImageDataset:
         )
 
         self.build_metadata()
-        self.segmentate_summary = summary
 
         return summary
 
@@ -489,47 +305,15 @@ class ImageDataset:
         thresholds: Optional[Dict[str, float]] = None,
         row_idx: Optional[int] = None,
         write_db: Union[bool, str, None] = True,
-        table_name="image",
+        table_name: str = "image",
         max_workers: Optional[int] = None
     ) -> Optional[pd.DataFrame]:
-        """Profile images at whole-image level.
-
-        Computes per-channel statistics (mean, std, min, max, median, skew,
-        sum, percentiles) for every imaging site.  When ``thresholds`` are
-        provided, additional object-count and area metrics are computed via
-        simple thresholding.
-
-        Parameters
-        ----------
-        channels : list of str, optional
-            Channel names to profile.  ``None`` = all channels.
-        thresholds : dict of str to float, optional
-            Per-channel intensity thresholds for binary mask creation.
-            Enables ``{ch}_area``, ``{ch}_n_objects``, ``{ch}_mean_object_area``
-            columns.
-        row_idx : int, optional
-            Profile a single row by index.  ``None`` = profile all rows.
-        write_db : bool or str or None
-            ``True``  → write to ``<measurement_dir>/result.db`` (table "image").
-            ``str``   → write to ``<measurement_dir>/<write_db>``.
-            ``False`` / ``None`` → return aggregated ``pd.DataFrame``.
-        table_name : str
-            table name
-        max_workers : int, optional
-            Maximum number of worker threads to use for parallel processing.
-            If None, uses the default number of threads for the system.
-
-        Returns
-        -------
-        pd.DataFrame or None
-            Aggregated results when ``write_db`` is falsy, else ``None``.
-        """
-        
+        """Profile images at whole-image level."""
         if row_idx is None:
             indices = range(len(self.metadata))
         else:
-            indices = [row_idx] if isinstance(row_idx, str) else row_idx
-            
+            indices = [row_idx] if isinstance(row_idx, int) else row_idx
+
         results = []
 
         def process_row(idx):
@@ -542,9 +326,9 @@ class ImageDataset:
                 if k not in self.mask_colnames + self.intensity_colnames
             }
 
-            result = profile_image_single_row(
+            result = measure_image(
                 image_data=image_data,
-                channel_names=self.channels,
+                channel_names=self.intensity_colnames,
                 metadata_row=metadata_row,
                 channels=channels,
                 thresholds=thresholds,
@@ -557,7 +341,7 @@ class ImageDataset:
                 db_path = self.dataset_dir / "result.db"
             else:
                 db_path = None
-            
+
             if write_db:
                 write_results_to_db(db_path, table_name, result_df, if_exists="append")
                 return None
@@ -565,116 +349,140 @@ class ImageDataset:
                 return result_df
 
         if max_workers is None or len(indices) <= 1:
-            # Use single-threaded processing for small datasets or when max_workers is None
             for idx in tqdm(indices, desc="Profiling images"):
                 result_df = process_row(idx)
                 if result_df is not None:
                     results.append(result_df)
         else:
-            # Use multi-threaded processing for larger datasets
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_idx = {executor.submit(process_row, idx): idx for idx in indices}
                 for future in tqdm(as_completed(future_to_idx), total=len(indices), desc="Profiling images"):
                     result_df = future.result()
                     if result_df is not None:
                         results.append(result_df)
-                
-        return results
+
+        return results if results else None
 
     def profile_object(
         self,
         mask_name: str,
         parent_mask_name: str = None,
-        row_idx: List[int] = None,
-        channels: List[str] = None,
-        profile: List[str] = ['shape', 'intensity'],
-        extra_properties: Optional[List[Union[str, Callable]]] = None,
-        extra_properties_kwargs: Optional[List[Optional[Dict]]] = None,
+        row_idx: Optional[Union[int, List[int]]] = None,
         write_db: Union[bool, str, None] = True,
-        table_name: str = None,
-        max_workers: Optional[int] = None
+        table_name: Optional[str] = None,
+        max_workers: Optional[int] = None,
+        intensity_channels: Optional[List[str]] = None,
+        glcm_channels: Optional[List[str]] = None,
+        glcm_distances: Optional[List[int]] = None,
+        granularity_channels: Optional[List[str]] = None,
+        granularity_background_radius: int = 10,
+        granularity_spectrum_length: int = 16,
+        granularity_subsample_size: float = 0.25,
+        radial_channels: Optional[List[str]] = None,
+        radial_n_bins: int = 5,
+        correlation_pairs: Optional[List[tuple]] = None,
     ) -> Optional[pd.DataFrame]:
         """Profile objects using the specified segmentation mask.
-
+        
         Parameters
         ----------
         mask_name : str
-            Name of the mask to use (e.g. ``"cell"``, ``"nuclei"``).
-            Must match a ``mask_{name}`` column in the metadata.
+            Name of the mask to use (e.g. "cell", "nuclei").
         parent_mask_name : str, optional
             Parent mask name for hierarchical child→parent assignment.
-            Adds a ``parent_{parent_mask_name}_id`` column to the output.
-        row_idx : int, optional
-            Profile a single row by index.  ``None`` = profile all rows.
-        channels : list of str, optional
-            Channel names to include in intensity measurements.
-            ``None`` = all channels.
-        profile : list of str, optional
-            Feature families to compute.  Any combination of
-            ``"shape"`` and ``"intensity"``.  Default: both.
-        extra_properties : list of str or callable, optional
-            Additional feature sets.  Accepts shorthand strings
-            ``'glcm'``, ``'granularity'``, ``'radial'`` or plain callables
-            built with the factory functions from ``extra_properties.py``.
-        extra_properties_kwargs : list of dict or None, optional
-            Per-item keyword arguments forwarded to string-shorthand factory
-            functions (e.g. ``[{"distances": [1, 2]}, None, {"n_bins": 6}]``).
-            Use ``None`` as a placeholder to keep defaults.
+        row_idx : int or list of int, optional
+            Profile a single row by index. None = profile all rows.
         write_db : bool or str or None
-            ``True``  → write to ``<measurement_dir>/result.db``
-                        (table named after ``mask_name``).
-            ``str``   → write to ``<measurement_dir>/<write_db>``.
-            ``False`` / ``None`` → return aggregated ``pd.DataFrame``.
-        table_name : str
-            table name, if None, use mask_name
+            True → write to result.db, str → write to custom path, None → return DataFrame.
+        table_name : str, optional
+            Table name. If None, use mask_name.
         max_workers : int, optional
-            Maximum number of worker threads to use for parallel processing.
-            If None, uses the default number of threads for the system.
-
+            Maximum number of worker threads.
+        intensity_channels : list of str, optional
+            Channels to compute intensity features from.
+        glcm_channels : list of str, optional
+            Channels to compute GLCM features from.
+        glcm_distances : list of int, optional
+            GLCM distances. Default: [1, 2, 3].
+        granularity_channels : list of str, optional
+            Channels to compute granularity features from.
+        granularity_background_radius : int
+            Background radius for granularity. Default: 10.
+        granularity_spectrum_length : int
+            Spectrum length for granularity. Default: 16.
+        granularity_subsample_size : float
+            Subsample size for granularity. Default: 0.25.
+        radial_channels : list of str, optional
+            Channels to compute radial distribution features from.
+        radial_n_bins : int
+            Number of radial bins. Default: 5.
+        correlation_pairs : list of tuple, optional
+            List of (channel1, channel2) tuples for correlation measurement.
+        
         Returns
         -------
         pd.DataFrame or None
-            Aggregated results (one row per object) when ``write_db`` is
-            falsy, else ``None``.
+            Aggregated results when write_db is falsy, else None.
         """
-        
-        channels = self.channels if channels is None else channels
-        
-        resolved_properties, col_names = build_extra_properties(
-            extra_properties,
-            n_channels=len(channels),
-            channels=channels,
-            extra_properties_kwargs=extra_properties_kwargs,
-        )
-
         if row_idx is None:
             indices = range(len(self.metadata))
         else:
-            indices = [row_idx] if isinstance(row_idx, str) else row_idx
-            
+            indices = [row_idx] if isinstance(row_idx, int) else row_idx
+
         results = []
-        
+
         def process_row(idx):
             row = self.metadata.iloc[idx]
-
-            image_data, mask_data = self.get_imageset(idx, channels=channels, masks=mask_name)
             metadata_row = row.to_dict()
             metadata_row = {
                 k: v for k, v in metadata_row.items()
                 if k not in self.mask_colnames + self.intensity_colnames
             }
+            
+            image_data, mask_data = self.get_imageset(idx)
+            
+            # Get the main mask
+            mask = mask_data[mask_name]
+            
+            # Get parent mask if parent_mask_name is provided
+            parent_mask = None
+            if parent_mask_name is not None:
+                parent_mask = mask_data.get(parent_mask_name, None)
 
-            result_df = profile_object_single_row(
-                image_data=image_data,
-                mask_data=mask_data,
-                # channel_names=self.channels,
+            # Build kwargs for measure_objects
+            measure_kwargs = {}
+            
+            # Radial distribution kwargs
+            if radial_channels is not None:
+                measure_kwargs['radial_distribution_channels'] = radial_channels
+                measure_kwargs['radial_distribution_kwargs'] = {'nbins': radial_n_bins}
+            
+            # Granularity kwargs
+            if granularity_channels is not None:
+                measure_kwargs['granularity_channels'] = granularity_channels
+                measure_kwargs['granularity_kwargs'] = {
+                    'scales': list(range(granularity_spectrum_length)),
+                    'subsample_size': granularity_subsample_size,
+                    'element_size': granularity_background_radius
+                }
+            
+            # GLCM kwargs
+            if glcm_channels is not None:
+                measure_kwargs['glcm_channels'] = glcm_channels
+                measure_kwargs['glcm_kwargs'] = {
+                    'distances': glcm_distances if glcm_distances is not None else [1, 2, 3]
+                }
+
+            result_df = measure_objects(
+                mask=mask,
+                img=image_data,
+                channel_names=self.intensity_colnames,
                 metadata_row=metadata_row,
-                channel_names=channels,
-                mask_name=mask_name,
-                parent_mask_name=parent_mask_name,
-                profile=profile,
-                extra_properties=resolved_properties,
-                col_names=col_names,
+                parent_mask=parent_mask,
+                parent_mask_name=parent_mask_name if parent_mask_name else "Parent",
+                intensity_channels=intensity_channels,
+                correlation_pairs=correlation_pairs,
+                **measure_kwargs,
             )
             
             if isinstance(write_db, str):
@@ -683,7 +491,7 @@ class ImageDataset:
                 db_path = self.dataset_dir / "result.db"
             else:
                 db_path = None
-            
+
             if write_db and result_df is not None:
                 current_table_name = mask_name if table_name is None else table_name
                 write_results_to_db(db_path, current_table_name, result_df, if_exists="append")
@@ -692,21 +500,19 @@ class ImageDataset:
                 return result_df
 
         if max_workers is None or len(indices) <= 1:
-            # Use single-threaded processing for small datasets or when max_workers is None
             for idx in tqdm(indices, desc=f"Profiling {mask_name}"):
                 result_df = process_row(idx)
                 if result_df is not None:
                     results.append(result_df)
         else:
-            # Use multi-threaded processing for larger datasets
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_idx = {executor.submit(process_row, idx): idx for idx in indices}
                 for future in tqdm(as_completed(future_to_idx), total=len(indices), desc=f"Profiling {mask_name}"):
                     result_df = future.result()
                     if result_df is not None:
                         results.append(result_df)
-                
-        return results
+
+        return results if results else None
 
     def crop_object(
         self,
