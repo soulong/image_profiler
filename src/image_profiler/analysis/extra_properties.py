@@ -209,7 +209,7 @@ def _granularity_all(
 
 
 def make_granularity(
-    scales: Sequence[int] = tuple(range(1, 17)),
+    scales: Sequence[int] = [1,3,5,7,10],
     channel: int = 0,
     subsample_size: int = 256,
     element_size: int = 10,

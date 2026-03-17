@@ -15,10 +15,10 @@ try:
 except ImportError:
     import imageio as iio
 
-def crop_cell(
+def crop_object(
     mask: Union[str, Path, np.ndarray],
     imgs: Union[None, str, Path, List[Union[str, Path]], np.ndarray] = None,
-    cell_ids: Union[int, List[int], None] = None,
+    object_ids: Union[int, List[int], None] = None,
     scale_factor: Union[float, None] = 65535.0,
     target_size: Optional[int] = None,
     clip_mask: bool = False,
@@ -37,7 +37,7 @@ def crop_cell(
         - Path/str: single channel image
         - List of Path/str: multiple channel images (stacked along last axis)
         - np.ndarray (H, W, C) or (H, W): pre-loaded image(s)
-    cell_ids : int, list of int, or None
+    object_ids : int, list of int, or None
         Cell ID(s) to crop. If None, crop all non-background cells.
     scale_factor : float or None
         Divide image by this value for normalization. None to skip.
@@ -51,7 +51,7 @@ def crop_cell(
         Rotate cell so major axis is horizontal.
     row_idx : int, list of int, or None
         Positional index/indices (0-based) into the sorted list of cell IDs
-        after resolving ``cell_ids``. When provided, only the cells at those
+        after resolving ``object_ids``. When provided, only the cells at those
         positions are processed. Useful for selecting cells by row position
         rather than by explicit label value.
         Example: row_idx=0 → first cell; row_idx=[0, 2, 4] → cells at
@@ -64,11 +64,12 @@ def crop_cell(
     Returns
     -------
     list of dict
-        [{'cell_id': int, 'cell_img': np.ndarray or None,
-          'cell_mask': np.ndarray or None}, ...]
-        ``cell_img`` shape is (H, W, C), dtype float64 when scale_factor is
+        [{'object_id': int, 
+        'img': np.ndarray or None,
+        'mask': np.ndarray or None}, ...]
+        ``img`` shape is (H, W, C), dtype float64 when scale_factor is
         set, otherwise preserves input dtype.
-        ``cell_mask`` shape is (H, W), dtype uint8.
+        ``mask`` shape is (H, W), dtype uint8.
     """
     # ------------------------------------------------------------------
     # Load mask
@@ -105,26 +106,26 @@ def crop_cell(
             )
 
     # ------------------------------------------------------------------
-    # Resolve cell IDs
+    # Resolve object IDs
     # ------------------------------------------------------------------
-    if cell_ids is None:
-        all_cell_ids: List[int] = np.unique(mask_arr[mask_arr != 0]).tolist()
-    elif isinstance(cell_ids, (int, np.integer)):
-        all_cell_ids = [int(cell_ids)]
+    if object_ids is None:
+        all_object_ids: List[int] = np.unique(mask_arr[mask_arr != 0]).tolist()
+    elif isinstance(object_ids, (int, np.integer)):
+        all_object_ids = [int(object_ids)]
     else:
-        all_cell_ids = [int(c) for c in cell_ids]
+        all_object_ids = [int(c) for c in object_ids]
 
     img_h, img_w = mask_arr.shape
     results: List[dict] = []
 
-    for cell_id in all_cell_ids:
+    for object_id in all_object_ids:
         try:
             # Fast membership check (avoids slow Python 'in' on large arrays)
-            if not np.any(mask_arr == cell_id):
-                results.append({'cell_id': cell_id, 'cell_img': None, 'cell_mask': None})
+            if not np.any(mask_arr == object_id):
+                results.append({'object_id': object_id, 'cell_img': None, 'cell_mask': None})
                 continue
 
-            cell_mask_bool = mask_arr == cell_id  # (H, W) bool
+            cell_mask_bool = mask_arr == object_id  # (H, W) bool
 
             # regionprops on binary uint8 directly — no need for label()
             props = regionprops(cell_mask_bool.astype(np.uint8))[0]
@@ -193,7 +194,7 @@ def crop_cell(
                 # Tight crop post-rotation
                 coords = np.column_stack(np.where(cropped_mask_bool))
                 if len(coords) == 0:
-                    results.append({'cell_id': cell_id, 'cell_img': None, 'cell_mask': None})
+                    results.append({'object_id': object_id, 'img': None, 'mask': None})
                     continue
                 ymin, xmin = coords.min(axis=0)
                 ymax, xmax = coords.max(axis=0)
@@ -251,13 +252,13 @@ def crop_cell(
                 cropped_img = cropped_img.astype(np.float64) / scale_factor
 
             results.append({
-                'cell_id':   cell_id,
-                'cell_img':  cropped_img,
-                'cell_mask': cropped_mask_uint8,
+                'object_id':   object_id,
+                'img':  cropped_img,
+                'mask': cropped_mask_uint8,
             })
 
         except Exception:
-            # Preserve cell_id in error results so callers can match them back
-            results.append({'cell_id': cell_id, 'cell_img': None, 'cell_mask': None})
+            # Preserve object_id in error results so callers can match them back
+            results.append({'object_id': object_id, 'img': None, 'mask': None})
 
     return results

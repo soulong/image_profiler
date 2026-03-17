@@ -3,7 +3,7 @@
 from image_profiler.dataset import ImageDataset
 from image_profiler.utils import (
     Database,
-    crop_cell,
+    crop_object,
     find_measurement_dirs,
     images_to_dataset,
     write_dataloader,
@@ -20,7 +20,7 @@ from image_profiler.preprocessing import (
 __all__ = [
     "ImageDataset",
     "Database",
-    "crop_cell",
+    "crop_object",
     "find_measurement_dirs",
     "images_to_dataset",
     "write_dataloader",

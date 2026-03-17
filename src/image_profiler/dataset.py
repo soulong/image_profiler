@@ -17,7 +17,7 @@ except ImportError:
 from image_profiler.utils.helper import images_to_dataset, write_dataloader
 from image_profiler.utils.database import write_results_to_db
 from image_profiler.utils.segmentate import cellpose_segment_measurement
-from image_profiler.utils.crop import crop_cell
+from image_profiler.utils.crop import crop_object
 from image_profiler.preprocessing.correction import fit_basic_models, transform_basic_models
 from image_profiler.preprocessing.split_tile import tile_images_from_metadata
 from image_profiler.preprocessing.z_projection import z_project_dataset
@@ -44,20 +44,21 @@ class ImageDataset:
         measurement_dir: Union[str, Path],
         image_pattern: Optional[str] = None,
         mask_pattern: Optional[str] = None,
-        dataset_kwargs: Optional[Dict] = None,
+        subset_pattern: Optional[str] = None,
         img_shape: Optional[tuple] = None,
         img_dtype: Optional[type] = None
     ) -> None:
         self.measurement_dir = Path(measurement_dir)
         self.image_pattern = image_pattern or self.DEFAULT_IMAGE_PATTERN
         self.mask_pattern = mask_pattern or self.DEFAULT_MASK_PATTERN
-        self._dataset_kwargs = dataset_kwargs or {}
+        self.subset_pattern = subset_pattern
+        self._img_shape: Optional[tuple] = img_shape
+        self._img_dtype: Optional[type] = img_dtype
+        
         self.meta_dict: Optional[Dict] = None
         self._metadata: Optional[pd.DataFrame] = None
         self._intensity_colnames: Optional[List[str]] = None
         self._mask_colnames: Optional[List[str]] = None
-        self._img_shape: Optional[tuple] = img_shape
-        self._img_dtype: Optional[type] = img_dtype
 
         self.build_metadata()
         self._auto_detect_image_properties()
@@ -131,13 +132,14 @@ class ImageDataset:
         self._img_shape = (h, w)
         self._img_dtype = dtype_mapping.get(detected_dtype, np.uint16)
 
-    def build_metadata(self, remove_na_row=True, **dataset_kwargs) -> None:
+    def build_metadata(self, image_subdir='Images', remove_na_row=True) -> None:
         self.meta_dict = images_to_dataset(
             self.measurement_dir,
             self.image_pattern,
             self.mask_pattern,
-            remove_na_row=remove_na_row,
-            **dataset_kwargs
+            self.subset_pattern,
+            image_subdir,
+            remove_na_row
         )
         self._metadata = self.meta_dict.get('metadata')
         self._intensity_colnames = self.meta_dict.get('intensity_colnames', [])
@@ -373,13 +375,13 @@ class ImageDataset:
         max_workers: Optional[int] = None,
         intensity_channels: Optional[List[str]] = None,
         glcm_channels: Optional[List[str]] = None,
-        glcm_distances: Optional[List[int]] = None,
+        glcm_distances: Optional[List[int]] = [2],
         granularity_channels: Optional[List[str]] = None,
-        granularity_background_radius: int = 10,
-        granularity_spectrum_length: int = 16,
-        granularity_subsample_size: float = 0.25,
+        granularity_element_size: int = 10,
+        granularity_scales: List[int] = [1, 3, 5, 7, 10],
+        granularity_subsample_size: int = 128,
         radial_channels: Optional[List[str]] = None,
-        radial_n_bins: int = 5,
+        radial_n_bins: int = 4,
         correlation_pairs: Optional[List[tuple]] = None,
     ) -> Optional[pd.DataFrame]:
         """Profile objects using the specified segmentation mask.
@@ -403,19 +405,19 @@ class ImageDataset:
         glcm_channels : list of str, optional
             Channels to compute GLCM features from.
         glcm_distances : list of int, optional
-            GLCM distances. Default: [1, 2, 3].
+            GLCM distances. Default: [2].
         granularity_channels : list of str, optional
             Channels to compute granularity features from.
-        granularity_background_radius : int
-            Background radius for granularity. Default: 10.
-        granularity_spectrum_length : int
-            Spectrum length for granularity. Default: 16.
-        granularity_subsample_size : float
-            Subsample size for granularity. Default: 0.25.
+        granularity_element_size : int
+            Element size for granularity. Default: 10.
+        granularity_scales : list of int
+            Spectrum scales for granularity. Default: [1, 3, 5, 7, 10].
+        granularity_subsample_size : int
+            Subsample size for granularity. Default: 128.
         radial_channels : list of str, optional
             Channels to compute radial distribution features from.
         radial_n_bins : int
-            Number of radial bins. Default: 5.
+            Number of radial bins. Default: 4.
         correlation_pairs : list of tuple, optional
             List of (channel1, channel2) tuples for correlation measurement.
         
@@ -461,9 +463,9 @@ class ImageDataset:
             if granularity_channels is not None:
                 measure_kwargs['granularity_channels'] = granularity_channels
                 measure_kwargs['granularity_kwargs'] = {
-                    'scales': list(range(granularity_spectrum_length)),
+                    'scales': list(granularity_scales),
                     'subsample_size': granularity_subsample_size,
-                    'element_size': granularity_background_radius
+                    'element_size': granularity_element_size
                 }
             
             # GLCM kwargs
@@ -519,7 +521,7 @@ class ImageDataset:
         mask_name: str = None,
         row_idx: Optional[Union[int, List[int]]] = None,
         channels: list[str] = None,
-        cell_ids: list[int] = None,
+        object_ids: list[int] = None,
         scale_factor: Union[float, None] = None,
         target_size: Optional[int] = None,
         clip_mask: bool = True,
@@ -543,10 +545,10 @@ class ImageDataset:
             for ch in channels:
                 img_paths.append(row['directory'] / row[ch])
 
-            crops = crop_cell(
+            crops = crop_object(
                 mask=mask_path,
                 imgs=img_paths,
-                cell_ids=cell_ids,
+                object_ids=object_ids,
                 scale_factor=scale_factor,
                 target_size=target_size,
                 clip_mask=clip_mask,
@@ -556,7 +558,7 @@ class ImageDataset:
             )
 
             for crop in crops:
-                crop['metadata_idx'] = idx
+                crop['metadata'] = row.to_dict() 
                 crop['mask_name'] = mask_name
 
             results.extend(crops)
